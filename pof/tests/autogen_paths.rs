@@ -507,6 +507,21 @@ fn take_geometry_from_handles_gaining_points() {
     assert!(path.points[1].turrets.is_empty());
 }
 
+/// Mirrors what the GUI does when "Also regenerate existing paths" is ticked: rebuild the one path
+/// FSO would use for each target, skipping any path more than one object claims, and leave
+/// everything else alone.
+fn regen_all_existing(model: &mut Model) {
+    for target in model.path_targets() {
+        if let Some(path_id) = model.first_path_for(target) {
+            if model.path_is_contested(path_id) {
+                continue;
+            }
+            let regenerated = model.gen_path_for(target, String::new());
+            model.paths[path_id.0 as usize].take_geometry_from(regenerated);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- docking bay path conflicts
 
 #[test]
@@ -561,6 +576,44 @@ fn a_contested_path_is_flagged() {
     assert!(model.path_claimants(own_path) == vec![PathTarget::DockingBay(0)], "a $dockNN-01 parent names no object");
     model.recheck_warnings(Set::All);
     assert!(model.warnings.iter().all(|warning| !matches!(warning, Warning::PathClaimedByMultipleObjects(_))));
+}
+
+#[test]
+fn regenerating_every_path_restores_the_generated_geometry() {
+    let mut model = turret_model();
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, 20.0), ..Default::default() });
+
+    // do a whole-model auto-gen first, the way the dialog would
+    let (generated, dock_assignments) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    for (bay_idx, path_id) in dock_assignments {
+        model.docking_bays[bay_idx].path = Some(path_id);
+    }
+    assert_eq!(model.paths.len(), 3, "turret01, engine01, dock");
+    let pristine = model.paths.clone();
+
+    // a second path naming engine01, which FSO ignores and regeneration must not touch
+    model.paths.push(Path { name: "spare".into(), parent: "$ENGINE01".into(), points: vec![] });
+
+    // now mangle the generated ones, as a user editing points by hand would
+    model.paths[0].name = "renamed by hand".into();
+    model.paths[0].points[0].position = Vec3d::new(999.0, 999.0, 999.0);
+    model.paths[1].points.clear();
+    model.paths[2].points[3].radius = 42.0;
+
+    regen_all_existing(&mut model);
+
+    for (idx, original) in pristine.iter().enumerate() {
+        assert_eq!(model.paths[idx].parent, original.parent, "path {} parent", idx);
+        assert_eq!(model.paths[idx].points.len(), original.points.len(), "path {} point count", idx);
+        for (a, b) in model.paths[idx].points.iter().zip(&original.points) {
+            assert_eq!(a.position, b.position, "path {} position", idx);
+            assert_eq!(a.radius.to_bits(), b.radius.to_bits(), "path {} radius", idx);
+        }
+    }
+    assert_eq!(model.paths[0].name, "renamed by hand", "a hand chosen name survives");
+    assert_eq!(model.paths[3].name, "spare");
+    assert!(model.paths[3].points.is_empty(), "the extra path naming engine01 is left alone");
 }
 
 #[test]

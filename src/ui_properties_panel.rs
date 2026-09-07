@@ -11,8 +11,8 @@ use glium::glutin::surface::WindowSurface;
 use glium::Display;
 use nalgebra_glm::TMat4;
 use pof::{
-    Dock, Error, NormalVec3, PathId, Set::*, SubmodelId, SubsysRotationAxis, SubsysRotationType, SubsysTranslationAxis, SubsysTranslationType, Vec3d,
-    Warning,
+    path_parent_matches, Dock, Error, NormalVec3, Path, PathId, PathTarget, Set::*, SubmodelId, SubsysRotationAxis, SubsysRotationType,
+    SubsysTranslationAxis, SubsysTranslationType, Vec3d, Warning,
 };
 
 use crate::Model;
@@ -41,6 +41,113 @@ pub fn parse_func<T, F: FnMut(&Model, T) -> UndoFunction>(val: F) -> F {
 /// doesnt do much other than boxing, but the real benefit is to coerce arbitrary closure types into the type needed by the undo system
 pub fn undo_func(val: impl FnMut(&mut Model) + 'static) -> UndoFunction {
     Box::new(val)
+}
+
+/// Swaps in a wholly new path list and set of docking bay path references, for the path operations
+/// which add paths or reassign a bay. The closure is self inverting, so one call covers undo and redo.
+fn apply_path_changes(undo_history: &mut undo::History<UndoAction>, model: &mut Model, new_paths: Vec<Path>, new_dock_refs: Vec<Option<PathId>>) {
+    let mut saved_paths = new_paths;
+    let mut saved_dock_refs = new_dock_refs;
+    model_action(
+        undo_history,
+        model,
+        undo_func(move |model: &mut Model| {
+            swap(&mut model.paths, &mut saved_paths);
+            // saved_dock_refs was built from docking_bays at capture time; the lengths should match,
+            // but guard anyway in case another action added bays after this one was recorded.
+            for (i, bay) in model.docking_bays.iter_mut().enumerate() {
+                if i < saved_dock_refs.len() {
+                    swap(&mut bay.path, &mut saved_dock_refs[i]);
+                }
+            }
+        }),
+    );
+}
+
+/// Rebuilds one existing path's geometry from its target, keeping its name and its per-point turret
+/// assignments. Only the one path is touched, so path ids and docking bay links stay valid.
+fn regenerate_path(undo_history: &mut undo::History<UndoAction>, model: &mut Model, path_id: PathId, target: PathTarget) {
+    let idx = path_id.0 as usize;
+    let regenerated = model.gen_path_for(target, String::new());
+    // a path already sitting where it would be generated doesn't need an undo step spending on it
+    if path_geometry_matches(&model.paths[idx], &regenerated) {
+        return;
+    }
+
+    let mut new_path = model.paths[idx].clone();
+    new_path.take_geometry_from(regenerated);
+
+    model_action(
+        undo_history,
+        model,
+        undo_func(move |model: &mut Model| {
+            info!("Regenerating: path {}", idx);
+            swap(&mut model.paths[idx], &mut new_path);
+        }),
+    );
+}
+
+/// Generates the missing path for `target`, appending it and, for a docking bay, linking the bay to it.
+fn generate_path_for(undo_history: &mut undo::History<UndoAction>, model: &mut Model, target: PathTarget) {
+    let mut new_paths = model.paths.clone();
+    let mut new_dock_refs: Vec<Option<PathId>> = model.docking_bays.iter().map(|bay| bay.path).collect();
+
+    let path_id = PathId(new_paths.len() as u32);
+    new_paths.push(model.gen_path_for(target, model.path_name_gen().next_name()));
+    if let PathTarget::DockingBay(bay_idx) = target {
+        new_dock_refs[bay_idx] = Some(path_id);
+    }
+
+    apply_path_changes(undo_history, model, new_paths, new_dock_refs);
+}
+
+/// Rebuilding a path more than one object lays claim to would silently reshape it for the others
+/// too, so every path action refuses until the user has sorted the claim out.
+const CONTESTED_TEXT: &str = "This path is claimed by more than one object, give one of them a different path first";
+
+/// Whether `path` already sits exactly where `generated` would put it, so regenerating it would
+/// change nothing and shouldn't cost an undo step.
+fn path_geometry_matches(path: &Path, generated: &Path) -> bool {
+    // the same notion of name equality claim resolution uses, so a path already pointing at the
+    // right object isn't rewritten - and charged an undo step - over a difference in spelling
+    path_parent_matches(&path.parent, &generated.parent)
+        && path.points.len() == generated.points.len()
+        && path
+            .points
+            .iter()
+            .zip(&generated.points)
+            .all(|(a, b)| a.position == b.position && a.radius == b.radius)
+}
+
+/// The one button behind every per-object path action: generates the path for `target` if it hasn't
+/// got one, otherwise regenerates the one FSO would actually use. Any extra paths naming the same
+/// object are left alone; FSO ignores them anyway.
+fn path_gen_button(
+    ui: &mut Ui, undo_history: &mut undo::History<UndoAction>, model: &mut Model, target: Option<PathTarget>, disabled_text: &str,
+) -> bool {
+    // the model decides what may own a path - callers hand over the object they have selected and a
+    // reason for the tooltip, rather than each restating the rule and drifting from it
+    let target = target.filter(|&target| model.can_own_a_path(target));
+
+    let existing = target.and_then(|target| model.first_path_for(target));
+    let contested = existing.is_some_and(|path| model.path_is_contested(path));
+    let label = if existing.is_some() { "Regenerate Path" } else { "Generate Path" };
+
+    let response = ui
+        .add_enabled(target.is_some() && !contested, egui::Button::new(label))
+        .on_hover_text("Generated paths are generic approximations, and should be reviewed afterwards")
+        .on_disabled_hover_text(if contested { CONTESTED_TEXT } else { disabled_text });
+
+    if response.clicked() {
+        let target = target.unwrap();
+        match existing {
+            Some(path_id) => regenerate_path(undo_history, model, path_id, target),
+            None => generate_path_for(undo_history, model, target),
+        }
+        true
+    } else {
+        false
+    }
 }
 
 pub enum IndexingButtonsResponse<T: Clone> {
@@ -2244,6 +2351,21 @@ impl PofToolsGui {
                     }
                 }
 
+                // Path ================================================================
+
+                ui.separator();
+
+                // a turret base submodel gets its turret's path, which uses different geometry
+                let smodel_target = selected_id.map(|id| self.model.canonical_path_target(PathTarget::Submodel(id)));
+                let disabled_text = if selected_id.is_some() {
+                    "Only named $special=subsystem submodels get paths in FSO"
+                } else {
+                    "Select a submodel first"
+                };
+                if path_gen_button(ui, undo_history, &mut self.model, smodel_target, disabled_text) {
+                    self.ui_state.properties_panel_dirty = true;
+                }
+
                 // Misc stats ================================================================
 
                 ui.separator();
@@ -2721,6 +2843,10 @@ impl PofToolsGui {
                     }
                 });
 
+                if path_gen_button(ui, undo_history, &mut self.model, bay_num.map(PathTarget::DockingBay), "Select a docking bay first") {
+                    self.ui_state.properties_panel_dirty = true;
+                }
+
                 ui.separator();
 
                 CollapsingHeader::new("Properties Raw").show(ui, |ui| {
@@ -3142,6 +3268,18 @@ impl PofToolsGui {
                 ui.label("Position:");
                 model_value_widget!(format!("{} position", current_tree_selection), ui, false, pos, position_string);
 
+                ui.add_space(10.0);
+                ui.separator();
+                let spcl_target = point_num.map(PathTarget::SpecialPoint);
+                let disabled_text = if point_num.is_some() {
+                    "Only named subsystem special points get paths in FSO - give it a name, and set the Type above to subsystem"
+                } else {
+                    "Select a special point first"
+                };
+                if path_gen_button(ui, undo_history, &mut self.model, spcl_target, disabled_text) {
+                    self.ui_state.properties_panel_dirty = true;
+                }
+
                 if let Some(mut response) = spec_point_idx_response {
                     let new_idx = response.get_new_ui_idx(&self.model.special_points);
 
@@ -3262,6 +3400,17 @@ impl PofToolsGui {
 
                 ui.label("Position:");
                 model_value_widget!(format!("{} position", current_tree_selection), ui, false, pos, position_string);
+
+                ui.add_space(10.0);
+                ui.separator();
+                let disabled_text = if turret_num.is_some() {
+                    "A turret's base submodel needs a name before FSO can give it a path"
+                } else {
+                    "Select a turret first"
+                };
+                if path_gen_button(ui, undo_history, &mut self.model, turret_num.map(PathTarget::Turret), disabled_text) {
+                    self.ui_state.properties_panel_dirty = true;
+                }
 
                 if let Some(mut response) = turret_idx_response {
                     let new_idx = response.get_new_ui_idx(&self.model.turrets);
@@ -3430,13 +3579,35 @@ impl PofToolsGui {
                     select_new_tree_val!(TreeValue::Paths(PathTreeValue::path_point(path_num.unwrap(), new_idx)));
                 }
 
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Rebuild just this path, from whichever object claims it
+                let regen_target = path_num.and_then(|num| self.model.path_target(PathId(num as u32)));
+                let contested = path_num.is_some_and(|num| self.model.path_is_contested(PathId(num as u32)));
+                let response = ui
+                    .add_enabled(regen_target.is_some() && !contested, egui::Button::new("Regenerate This Path"))
+                    .on_hover_text("Rebuilds this path's points from the object which claims it, keeping its name")
+                    .on_disabled_hover_text(if contested {
+                        CONTESTED_TEXT
+                    } else if path_num.is_some() {
+                        "This path's parent doesn't name any turret, subsystem or docking bay"
+                    } else {
+                        "Select a path first"
+                    });
+                if response.clicked() {
+                    regenerate_path(undo_history, &mut self.model, PathId(path_num.unwrap() as u32), regen_target.unwrap());
+                    self.ui_state.properties_panel_dirty = true;
+                }
+
                 // Auto-Gen Paths: generates approach paths for all turrets, subsystem submodels,
                 // subsystem special points, and docking bays that don't already have paths.
                 // Ported from PCS2
-                ui.add_space(10.0);
-                ui.separator();
                 if ui.button("Auto-Gen Paths").clicked() {
                     self.auto_gen_paths_confirm = true;
+                    // start each run unticked - this one discards hand tuned paths, so it shouldn't
+                    // carry over from a previous run, let alone a previously loaded model
+                    self.auto_gen_paths_regen_existing = false;
                 }
 
                 // Confirmation popup for autogen paths
@@ -3453,6 +3624,13 @@ impl PofToolsGui {
                                 approximations and should be reviewed and adjusted manually afterwards.",
                             );
                             ui.add_space(8.0);
+                            ui.checkbox(&mut self.auto_gen_paths_regen_existing, "Also regenerate existing paths")
+                                .on_hover_text(
+                                    "Rebuilds the path each turret, subsystem and docking bay is already using, discarding \
+                                     any adjustments made to it. Paths claimed by more than one object are left alone, as \
+                                     are spare paths and any whose parent names nothing.",
+                                );
+                            ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 if ui.button("OK").clicked() {
                                     confirmed = true;
@@ -3465,35 +3643,43 @@ impl PofToolsGui {
                         });
 
                     if confirmed {
-                        let (new_paths, dock_assignments) = self.model.compute_auto_gen_paths();
-                        if !new_paths.is_empty() || !dock_assignments.is_empty() {
-                            // Build the full "after" state for the swap based undo closure
-                            let mut post_paths = self.model.paths.clone();
-                            post_paths.extend(new_paths);
-                            let mut post_dock_refs: Vec<Option<PathId>> = self.model.docking_bays.iter().map(|d| d.path).collect();
-                            for &(bay_idx, path_id) in &dock_assignments {
-                                post_dock_refs[bay_idx] = Some(path_id);
-                            }
+                        // Build the full "after" state for the swap based undo closure
+                        let (generated, dock_assignments) = self.model.compute_auto_gen_paths();
+                        let mut changed = !generated.is_empty();
+                        let mut post_paths = self.model.paths.clone();
+                        post_paths.extend(generated);
+                        let mut post_dock_refs: Vec<Option<PathId>> = self.model.docking_bays.iter().map(|d| d.path).collect();
+                        for &(bay_idx, path_id) in &dock_assignments {
+                            post_dock_refs[bay_idx] = Some(path_id);
+                        }
 
-                            // The swap closure is self inverting... each call toggles between
-                            // pre-auto-gen and post-auto-gen states, giving correct undo/redo.
-                            let mut saved_paths = post_paths;
-                            let mut saved_dock_refs = post_dock_refs;
-                            model_action(
-                                undo_history,
-                                &mut self.model,
-                                undo_func(move |model: &mut Model| {
-                                    swap(&mut model.paths, &mut saved_paths);
-                                    // saved_dock_refs was built from docking_bays at capture time;
-                                    // the lengths should match, but guard anyway in case another
-                                    // action added bays after this one was recorded.
-                                    for (i, bay) in model.docking_bays.iter_mut().enumerate() {
-                                        if i < saved_dock_refs.len() {
-                                            swap(&mut bay.path, &mut saved_dock_refs[i]);
-                                        }
+                        // ...and on top of that, rebuild the paths which already existed, if asked to.
+                        // Only the path FSO would actually use is touched; any extras naming the same
+                        // object are left alone.
+                        if self.auto_gen_paths_regen_existing {
+                            for target in self.model.path_targets() {
+                                if let Some(path_id) = self.model.first_path_for(target) {
+                                    // a path more than one object claims is left for the user to sort
+                                    // out, rather than having one claimant silently reshape it for the
+                                    // others
+                                    if self.model.path_is_contested(path_id) {
+                                        continue;
                                     }
-                                }),
-                            );
+                                    let path = &mut post_paths[path_id.0 as usize];
+                                    let regenerated = self.model.gen_path_for(target, String::new());
+                                    // a path already sitting exactly where it would be generated is
+                                    // left alone, so a model with nothing to do records no undo step
+                                    if !path_geometry_matches(path, &regenerated) {
+                                        path.take_geometry_from(regenerated);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if changed {
+                            apply_path_changes(undo_history, &mut self.model, post_paths, post_dock_refs);
+                            self.ui_state.properties_panel_dirty = true;
                         }
                     }
                 }
