@@ -1,0 +1,570 @@
+//! Tests for auto-generated paths: the `PathTarget` primitives and the whole-model
+//! `compute_auto_gen_paths` built on top of them.
+
+use pof::*;
+
+fn smodel(id: u32, name: &str, props: &str, offset: Vec3d, radius: f32) -> Submodel {
+    Submodel {
+        id: SubmodelId(id),
+        name: name.to_string(),
+        properties: props.to_string(),
+        offset,
+        radius,
+        ..Default::default()
+    }
+}
+
+/// detail0, one subsystem submodel (engine01), and one plain submodel which never gets a path.
+fn base_model() -> Model {
+    let mut model = Model::default();
+    model.submodels = SubmodelVec(vec![
+        smodel(0, "detail0", "", Vec3d::ZERO, 100.0),
+        smodel(1, "engine01", "$special=subsystem", Vec3d::new(0.0, 0.0, -50.0), 10.0),
+        smodel(2, "hull", "", Vec3d::new(0.0, 10.0, 0.0), 20.0),
+    ]);
+    model
+}
+
+/// base_model plus a turret whose base submodel is itself flagged as a subsystem.
+fn turret_model() -> Model {
+    let mut model = base_model();
+    model.submodels.0.push(smodel(3, "turret01", "$special=subsystem", Vec3d::new(10.0, 0.0, 0.0), 5.0));
+    model.submodels.0.push(smodel(4, "turret01-barrel", "", Vec3d::ZERO, 3.0));
+    model.turrets.push(Turret {
+        base_model: SubmodelId(3),
+        gun_model: SubmodelId(4),
+        normal: NormalVec3::try_from(Vec3d::new(1.0, 0.0, 0.0)).unwrap(),
+        fire_points: vec![],
+    });
+    model
+}
+
+fn parents(paths: &[Path]) -> Vec<&str> {
+    paths.iter().map(|path| path.parent.as_str()).collect()
+}
+
+// ---------------------------------------------------------------- whole model generation
+
+#[test]
+fn subsystem_submodel_gets_a_path() {
+    let model = base_model();
+    let (paths, docks) = model.compute_auto_gen_paths();
+    assert!(docks.is_empty());
+    assert_eq!(parents(&paths), vec!["engine01"], "only the subsystem submodel should get a path");
+    assert_eq!(paths[0].name, "$path01");
+    assert_eq!(paths[0].points.len(), 2);
+}
+
+#[test]
+fn spaced_separator_is_still_a_subsystem() {
+    let mut model = base_model();
+    // FSO accepts these separators (get_user_prop_value skips whitespace, '=' and ':'),
+    // so pof-tools has to as well
+    model.submodels.0.push(smodel(3, "sensors", "$special: subsystem", Vec3d::new(0.0, 30.0, 0.0), 4.0));
+    model.submodels.0.push(smodel(4, "comms", "$special = subsystem", Vec3d::new(0.0, -30.0, 0.0), 4.0));
+    let (paths, _) = model.compute_auto_gen_paths();
+    assert_eq!(parents(&paths), vec!["engine01", "sensors", "comms"]);
+}
+
+#[test]
+fn existing_path_dedupes_case_insensitively() {
+    let mut model = base_model();
+    model.paths.push(Path { name: "$path01".into(), parent: "ENGINE01".into(), points: vec![] });
+    let (paths, _) = model.compute_auto_gen_paths();
+    assert!(paths.is_empty(), "a differently cased parent should still count as covered: {:?}", parents(&paths));
+}
+
+#[test]
+fn special_point_dedupes_across_dollar_prefix() {
+    let mut model = base_model();
+    // name stored without the '$', as a dae import can produce; the path's parent has one
+    model.special_points.push(SpecialPoint {
+        name: "repair".into(),
+        properties: "$special=subsystem".into(),
+        position: Vec3d::new(0.0, 5.0, 0.0),
+        radius: 2.0,
+    });
+    let (paths, _) = model.compute_auto_gen_paths();
+    assert_eq!(paths.len(), 2, "engine01 + repair");
+
+    model.paths.push(Path { name: "$path01".into(), parent: "$Repair".into(), points: vec![] });
+    let (paths, _) = model.compute_auto_gen_paths();
+    assert_eq!(parents(&paths), vec!["engine01"], "the special point should already be covered");
+}
+
+#[test]
+fn dock_paths_are_named_and_assigned() {
+    let mut model = base_model();
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, 20.0), ..Default::default() });
+    let (paths, docks) = model.compute_auto_gen_paths();
+    assert_eq!(paths.len(), 2, "engine01 then the dock");
+    assert_eq!(paths[1].parent, "$dock01-01");
+    assert_eq!(paths[1].points.len(), 4);
+    assert_eq!(docks, vec![(0, PathId(1))], "dock 0 points at index 1 of the combined list");
+}
+
+#[test]
+fn turret_beats_submodel_path() {
+    let model = turret_model();
+    let (paths, _) = model.compute_auto_gen_paths();
+    assert_eq!(
+        parents(&paths),
+        vec!["turret01", "engine01"],
+        "turret path first, and no second, wrongly shaped path for its base submodel"
+    );
+}
+
+// ---------------------------------------------------------------- path targets
+
+#[test]
+fn path_targets_are_in_generation_order_and_skip_turret_bases() {
+    let mut model = turret_model();
+    model.special_points.push(SpecialPoint {
+        name: "$repair".into(),
+        properties: "$special=subsystem".into(),
+        position: Vec3d::new(0.0, 5.0, 0.0),
+        radius: 2.0,
+    });
+    model.special_points.push(SpecialPoint { name: "$decor".into(), properties: "".into(), position: Vec3d::ZERO, radius: 1.0 });
+    model.docking_bays.push(Dock::default());
+
+    assert_eq!(
+        model.path_targets(),
+        vec![
+            PathTarget::Turret(0),
+            PathTarget::Submodel(SubmodelId(1)), // engine01, but NOT turret01 (SubmodelId(3))
+            PathTarget::SpecialPoint(0),         // $repair, but not the non-subsystem $decor
+            PathTarget::DockingBay(0),
+        ]
+    );
+}
+
+#[test]
+fn canonical_path_target_folds_a_turret_base_into_its_turret() {
+    let model = turret_model();
+    assert_eq!(model.canonical_path_target(PathTarget::Submodel(SubmodelId(3))), PathTarget::Turret(0));
+    assert_eq!(model.canonical_path_target(PathTarget::Submodel(SubmodelId(1))), PathTarget::Submodel(SubmodelId(1)));
+    assert_eq!(model.canonical_path_target(PathTarget::DockingBay(4)), PathTarget::DockingBay(4));
+}
+
+#[test]
+fn gen_path_for_matches_what_the_whole_model_pass_produces() {
+    let model = turret_model();
+    let (paths, _) = model.compute_auto_gen_paths();
+
+    for (path, target) in paths.iter().zip(model.path_targets()) {
+        let single = model.gen_path_for(target, path.name.clone());
+        assert_eq!(single.parent, path.parent);
+        assert_eq!(single.points.len(), path.points.len());
+        for (a, b) in single.points.iter().zip(&path.points) {
+            assert_eq!(a.position, b.position, "{} position", target);
+            assert_eq!(a.radius.to_bits(), b.radius.to_bits(), "{} radius", target);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- reverse lookup
+
+#[test]
+fn path_target_finds_the_owning_object() {
+    let mut model = turret_model();
+    model.paths.push(Path { name: "$path01".into(), parent: "turret01".into(), points: vec![] });
+    model.paths.push(Path { name: "$path02".into(), parent: "Engine01".into(), points: vec![] });
+    model.paths.push(Path { name: "$path03".into(), parent: "nothing here".into(), points: vec![] });
+
+    assert_eq!(model.path_target(PathId(0)), Some(PathTarget::Turret(0)));
+    assert_eq!(model.path_target(PathId(1)), Some(PathTarget::Submodel(SubmodelId(1))));
+    assert_eq!(model.path_target(PathId(2)), None, "an unmatched parent is legitimate, not an error");
+    assert_eq!(model.path_target(PathId(99)), None, "a dangling id must not panic or claim a path");
+}
+
+#[test]
+fn a_docks_index_link_wins_over_the_parent_name() {
+    let mut model = turret_model();
+    // a path which *says* it belongs to the turret, but which bay 0 actually links to
+    model.paths.push(Path { name: "$path01".into(), parent: "turret01".into(), points: vec![] });
+    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
+
+    assert_eq!(model.path_target(PathId(0)), Some(PathTarget::DockingBay(0)), "the index link is what FSO follows");
+    assert_eq!(model.first_path_for(PathTarget::DockingBay(0)), Some(PathId(0)));
+}
+
+#[test]
+fn a_dangling_dock_link_yields_no_path() {
+    let mut model = base_model();
+    model.docking_bays.push(Dock { path: Some(PathId(7)), ..Default::default() });
+    assert_eq!(model.first_path_for(PathTarget::DockingBay(0)), None);
+    assert!(model.paths_for(PathTarget::DockingBay(0)).is_empty());
+}
+
+#[test]
+fn extra_paths_for_one_target_are_all_reported_but_only_the_first_is_live() {
+    let mut model = base_model();
+    model.paths.push(Path { name: "$path01".into(), parent: "engine01".into(), points: vec![] });
+    model.paths.push(Path { name: "$path02".into(), parent: "$ENGINE01".into(), points: vec![] });
+
+    let target = PathTarget::Submodel(SubmodelId(1));
+    assert_eq!(model.paths_for(target), vec![PathId(0), PathId(1)]);
+    // FSO's model_set_subsys_path_nums stops at the first match, so the second is dead weight
+    assert_eq!(model.first_path_for(target), Some(PathId(0)));
+}
+
+// ---------------------------------------------------------------- claimants
+
+#[test]
+fn an_ordinary_path_has_exactly_one_claimant() {
+    let mut model = turret_model();
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, 20.0), ..Default::default() });
+    let (generated, assignments) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    for (bay, path) in assignments {
+        model.docking_bays[bay].path = Some(path);
+    }
+
+    // a turret path names the base submodel, but the turret and its base are one object
+    assert_eq!(model.path_claimants(PathId(0)), vec![PathTarget::Turret(0)]);
+    assert_eq!(model.path_claimants(PathId(1)), vec![PathTarget::Submodel(SubmodelId(1))]);
+    assert_eq!(model.path_claimants(PathId(2)), vec![PathTarget::DockingBay(0)]);
+    assert!((0..3).all(|idx| !model.path_is_contested(PathId(idx))));
+
+    assert!(model.path_claimants(PathId(99)).is_empty(), "a dangling id claims nothing");
+}
+
+#[test]
+fn a_name_shared_by_two_objects_is_contested() {
+    let mut model = base_model();
+    model.submodels.0.push(smodel(3, "repair", "$special=subsystem", Vec3d::new(0.0, 10.0, 0.0), 5.0));
+    model.special_points.push(SpecialPoint {
+        name: "$repair".into(),
+        properties: "$special=subsystem".into(),
+        position: Vec3d::new(0.0, 5.0, 0.0),
+        radius: 2.0,
+    });
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+
+    // one path between the two of them, which is all FSO would use, rather than one each
+    assert_eq!(parents(&model.paths), vec!["engine01", "repair"]);
+    assert!(model.compute_auto_gen_paths().0.is_empty(), "still idempotent");
+
+    // both objects find it, so neither panel offers to append another
+    let smodel_target = PathTarget::Submodel(SubmodelId(3));
+    let spcl_target = PathTarget::SpecialPoint(0);
+    assert_eq!(model.first_path_for(smodel_target), Some(PathId(1)));
+    assert_eq!(model.first_path_for(spcl_target), Some(PathId(1)));
+
+    // ...and they're both claiming it, so neither may regenerate it. The name collision is a real
+    // problem with the model, and the user resolves it by renaming one of the two.
+    assert_eq!(model.path_claimants(PathId(1)), vec![smodel_target, spcl_target]);
+    assert!(model.path_is_contested(PathId(1)));
+}
+
+#[test]
+fn a_decorative_object_lays_no_claim_to_a_subsystems_path() {
+    let mut model = base_model();
+    model.submodels.0.push(smodel(3, "sensors", "$special=subsystem", Vec3d::new(0.0, 30.0, 0.0), 4.0));
+    // same name, but no $special=subsystem, so FSO never hands it a path
+    model.special_points.push(SpecialPoint {
+        name: "$sensors".into(),
+        properties: "".into(),
+        position: Vec3d::new(0.0, 5.0, 0.0),
+        radius: 2.0,
+    });
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+
+    let sensors = PathId(1);
+    assert_eq!(model.path_claimants(sensors), vec![PathTarget::Submodel(SubmodelId(3))]);
+    assert!(!model.path_is_contested(sensors), "a decorative namesake must not deadlock the subsystem");
+    assert_eq!(model.path_target(sensors), Some(PathTarget::Submodel(SubmodelId(3))), "and it keeps submodel geometry");
+}
+
+#[test]
+fn two_bays_pointing_at_one_path_are_contested() {
+    let mut model = base_model();
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, 20.0), ..Default::default() });
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, -20.0), ..Default::default() });
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+
+    // the user repoints bay 1 at bay 0's path
+    model.docking_bays[0].path = Some(PathId(1));
+    model.docking_bays[1].path = Some(PathId(1));
+
+    assert_eq!(model.path_claimants(PathId(1)), vec![PathTarget::DockingBay(0), PathTarget::DockingBay(1)]);
+    assert!(model.path_is_contested(PathId(1)));
+}
+
+#[test]
+fn a_bay_linked_to_another_objects_path_is_contested() {
+    let mut model = turret_model();
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    assert_eq!(model.paths[0].parent, "turret01");
+
+    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
+
+    assert_eq!(model.path_claimants(PathId(0)), vec![PathTarget::Turret(0), PathTarget::DockingBay(0)]);
+    assert!(model.path_is_contested(PathId(0)));
+}
+
+#[test]
+fn two_objects_of_the_same_kind_sharing_a_name_are_contested() {
+    let mut model = base_model();
+    // a second submodel with engine01's name. Nothing stops a file doing this, and FSO hands both
+    // of them the first path matching the name.
+    model.submodels.0.push(smodel(3, "engine01", "$special=subsystem", Vec3d::new(0.0, 0.0, 50.0), 10.0));
+
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+
+    // one path between the two of them, the same as when the two are of different kinds
+    assert_eq!(parents(&model.paths), vec!["engine01"]);
+    assert!(model.compute_auto_gen_paths().0.is_empty(), "and generating again adds nothing");
+
+    let (first, second) = (PathTarget::Submodel(SubmodelId(1)), PathTarget::Submodel(SubmodelId(3)));
+    assert_eq!(model.path_claimants(PathId(0)), vec![first, second]);
+    assert!(model.path_is_contested(PathId(0)));
+    // neither is left looking pathless, which would have the panel offer to append another
+    assert_eq!(model.first_path_for(first), Some(PathId(0)));
+    assert_eq!(model.first_path_for(second), Some(PathId(0)));
+}
+
+#[test]
+fn generating_twice_over_adds_nothing_the_second_time() {
+    // idempotency is the behavioural shape of the claimant invariant: if some object which can own a
+    // path is missing from a generated path's claimants, auto-gen generates for it again, forever.
+    let mut model = turret_model();
+    model.submodels.0.push(smodel(5, "engine01", "$special=subsystem", Vec3d::new(0.0, 0.0, 60.0), 8.0));
+    model.submodels.0.push(smodel(6, "$repair", "", Vec3d::new(0.0, 20.0, 0.0), 4.0));
+    model.special_points.push(SpecialPoint {
+        name: "$repair".into(),
+        properties: "$special=subsystem".into(),
+        position: Vec3d::new(0.0, 5.0, 0.0),
+        radius: 2.0,
+    });
+    model.special_points.push(SpecialPoint {
+        name: "repair".into(),
+        properties: "$special=subsystem".into(),
+        position: Vec3d::new(0.0, -5.0, 0.0),
+        radius: 2.0,
+    });
+    model.special_points.push(SpecialPoint { name: "$turret01".into(), properties: "".into(), position: Vec3d::ZERO, radius: 1.0 });
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, 20.0), ..Default::default() });
+
+    let (generated, assignments) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    for (bay, path) in assignments {
+        model.docking_bays[bay].path = Some(path);
+    }
+
+    let (again, assignments) = model.compute_auto_gen_paths();
+    assert!(
+        again.is_empty() && assignments.is_empty(),
+        "auto-gen is not idempotent, it would keep adding: {:?}",
+        again.iter().map(|path| &path.parent).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn everything_which_claims_a_path_is_something_which_could_own_one() {
+    // the invariant the target resolution helpers exist to keep: name matching must apply the same
+    // eligibility rule path_targets does. Every round of review so far has turned up a version of
+    // this drifting, so assert it rather than aligning the two by hand.
+    let mut model = turret_model();
+
+    // decorative namesakes of every kind, none of which FSO would hand a path to
+    model.submodels.0.push(smodel(5, "$repair", "", Vec3d::new(0.0, 20.0, 0.0), 4.0));
+    model.special_points.push(SpecialPoint {
+        name: "$repair".into(),
+        properties: "$special=subsystem".into(),
+        position: Vec3d::new(0.0, 5.0, 0.0),
+        radius: 2.0,
+    });
+    model.special_points.push(SpecialPoint {
+        name: "$engine01".into(),
+        properties: "".into(),
+        position: Vec3d::new(0.0, -5.0, 0.0),
+        radius: 2.0,
+    });
+    model.special_points.push(SpecialPoint { name: "$turret01".into(), properties: "".into(), position: Vec3d::ZERO, radius: 1.0 });
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, 20.0), ..Default::default() });
+
+    let (generated, assignments) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    for (bay, path) in assignments {
+        model.docking_bays[bay].path = Some(path);
+    }
+    // and a hand authored path naming something decorative
+    model.paths.push(Path { name: "$path09".into(), parent: "$engine01".into(), points: vec![] });
+
+    let targets = model.path_targets();
+    for idx in 0..model.paths.len() {
+        for claimant in model.path_claimants(PathId(idx as u32)) {
+            assert!(model.can_own_a_path(claimant), "path {} claimed by {} which cannot own one", idx, claimant);
+            assert!(targets.contains(&claimant), "path {} claimed by {} which path_targets does not yield", idx, claimant);
+        }
+    }
+
+    // the decorative namesakes leave the real subsystems alone
+    assert!(!model.path_is_contested(PathId(0)), "turret01");
+    assert!(!model.path_is_contested(PathId(1)), "engine01");
+}
+
+// ---------------------------------------------------------------- name allocation
+
+#[test]
+fn path_name_number_only_reads_path_names() {
+    assert_eq!(path_name_number("$path05"), Some(5));
+    assert_eq!(path_name_number("$Path12"), Some(12));
+    assert_eq!(path_name_number("$path"), None);
+    assert_eq!(path_name_number("$dock01-01"), None);
+    assert_eq!(path_name_number("hangar approach"), None);
+}
+
+#[test]
+fn path_name_gen_continues_past_existing_names() {
+    let mut model = base_model();
+    model.paths.push(Path { name: "$path03".into(), parent: "".into(), points: vec![] });
+    model.paths.push(Path { name: "$Path07".into(), parent: "".into(), points: vec![] });
+    model.paths.push(Path { name: "hand named".into(), parent: "".into(), points: vec![] });
+
+    let mut names = model.path_name_gen();
+    assert_eq!(names.next_name(), "$path08");
+    assert_eq!(names.next_name(), "$path09");
+    assert_eq!(names.next_name(), "$path10");
+
+    // a fresh single shot allocator agrees with the first name of a batch
+    assert_eq!(model.path_name_gen().next_name(), "$path08");
+}
+
+#[test]
+fn path_names_are_zero_padded_from_one() {
+    let mut names = PathNameGen::default();
+    assert_eq!(names.next_name(), "$path01");
+    names.observe("$path98");
+    assert_eq!(names.next_name(), "$path99");
+    assert_eq!(names.next_name(), "$path100");
+}
+
+#[test]
+fn path_parent_matching_ignores_case_and_a_leading_dollar() {
+    assert!(path_parent_matches("$Repair", "repair"));
+    assert!(path_parent_matches("TURRET01", "turret01"));
+    assert!(path_parent_matches("$engine", "$ENGINE"));
+    assert!(!path_parent_matches("turret01", "turret02"));
+    assert!(!path_parent_matches("$dock01-01", "dock01"));
+}
+
+// ---------------------------------------------------------------- regeneration in place
+
+#[test]
+fn take_geometry_from_keeps_the_name_and_the_turret_assignments() {
+    let mut path = Path {
+        name: "hangar approach".into(),
+        parent: "old parent".into(),
+        points: vec![
+            PathPoint { position: Vec3d::ZERO, radius: 1.0, turrets: vec![SubmodelId(3)] },
+            PathPoint { position: Vec3d::ZERO, radius: 2.0, turrets: vec![SubmodelId(4), SubmodelId(5)] },
+            PathPoint { position: Vec3d::ZERO, radius: 3.0, turrets: vec![SubmodelId(6)] },
+        ],
+    };
+    let generated = Path {
+        name: "$path01".into(),
+        parent: "turret01".into(),
+        points: vec![
+            PathPoint { position: Vec3d::new(1.0, 0.0, 0.0), radius: 10.0, turrets: vec![] },
+            PathPoint { position: Vec3d::new(2.0, 0.0, 0.0), radius: 20.0, turrets: vec![] },
+        ],
+    };
+
+    path.take_geometry_from(generated);
+
+    assert_eq!(path.name, "hangar approach", "a hand chosen name survives regeneration");
+    assert_eq!(path.parent, "turret01");
+    assert_eq!(path.points.len(), 2, "the surplus point is dropped");
+    assert_eq!(path.points[0].position, Vec3d::new(1.0, 0.0, 0.0));
+    assert_eq!(path.points[0].radius, 10.0);
+    // these aren't editable in the GUI but do round trip through the file, so they must survive
+    assert_eq!(path.points[0].turrets, vec![SubmodelId(3)]);
+    assert_eq!(path.points[1].turrets, vec![SubmodelId(4), SubmodelId(5)]);
+}
+
+#[test]
+fn take_geometry_from_handles_gaining_points() {
+    let mut path = Path {
+        name: "$path01".into(),
+        parent: "engine01".into(),
+        points: vec![PathPoint { position: Vec3d::ZERO, radius: 1.0, turrets: vec![SubmodelId(3)] }],
+    };
+    let mut model = base_model();
+    model.docking_bays.push(Dock::default());
+    path.take_geometry_from(model.gen_path_for(PathTarget::DockingBay(0), String::new()));
+
+    assert_eq!(path.name, "$path01");
+    assert_eq!(path.points.len(), 4);
+    assert_eq!(path.points[0].turrets, vec![SubmodelId(3)]);
+    assert!(path.points[1].turrets.is_empty());
+}
+
+#[test]
+fn an_empty_parent_names_nothing() {
+    // every path in a POF older than version 20.02 has an empty parent, since the field isn't
+    // written before then, and FSO doesn't resolve those either
+    let mut model = base_model();
+    model.submodels.0.push(smodel(3, "", "$special=subsystem", Vec3d::new(0.0, 20.0, 0.0), 4.0));
+    model.paths.push(Path { name: "$path01".into(), parent: String::new(), points: vec![] });
+    model.paths.push(Path { name: "$path02".into(), parent: "$".into(), points: vec![] });
+
+    for idx in 0..2 {
+        assert!(model.path_claimants(PathId(idx)).is_empty(), "path {} claims nothing", idx);
+        assert!(!model.path_is_contested(PathId(idx)));
+        assert_eq!(model.path_target(PathId(idx)), None);
+    }
+
+    // an object with no name can't be pointed at by a parent, so it isn't a target at all - offering
+    // to generate for it would generate again on every run
+    assert!(!model.can_own_a_path(PathTarget::Submodel(SubmodelId(3))));
+    assert!(!model.path_targets().contains(&PathTarget::Submodel(SubmodelId(3))));
+
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    assert_eq!(parents(&model.paths).last(), Some(&"engine01"));
+    assert!(model.compute_auto_gen_paths().0.is_empty(), "still idempotent with an unnamed subsystem about");
+
+}
+
+#[test]
+fn nothing_unnamed_can_own_a_path() {
+    // whatever the kind, an object with no name can't be pointed at by a path's parent, so it can't
+    // own one - and generating for it anyway would generate again on every run. The panels ask this
+    // predicate rather than checking is_subsystem themselves, so the two can't disagree.
+    let mut model = base_model();
+    model.submodels.0.push(smodel(3, "", "$special=subsystem", Vec3d::new(0.0, 20.0, 0.0), 4.0));
+    model.submodels.0.push(smodel(4, "", "", Vec3d::new(10.0, 0.0, 0.0), 5.0)); // an unnamed turret base
+    model.submodels.0.push(smodel(5, "barrel", "", Vec3d::ZERO, 3.0));
+    model.turrets.push(Turret {
+        base_model: SubmodelId(4),
+        gun_model: SubmodelId(5),
+        normal: NormalVec3::try_from(Vec3d::new(1.0, 0.0, 0.0)).unwrap(),
+        fire_points: vec![],
+    });
+    model.special_points.push(SpecialPoint {
+        name: String::new(),
+        properties: "$special=subsystem".into(),
+        position: Vec3d::new(0.0, 5.0, 0.0),
+        radius: 2.0,
+    });
+
+    assert!(!model.can_own_a_path(PathTarget::Turret(0)), "turret with an unnamed base");
+    assert!(!model.can_own_a_path(PathTarget::Submodel(SubmodelId(3))), "unnamed subsystem submodel");
+    assert!(!model.can_own_a_path(PathTarget::SpecialPoint(0)), "unnamed subsystem special point");
+    assert!(model.can_own_a_path(PathTarget::Submodel(SubmodelId(1))), "engine01 still can");
+
+    assert_eq!(model.path_targets(), vec![PathTarget::Submodel(SubmodelId(1))]);
+
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    assert_eq!(parents(&model.paths), vec!["engine01"]);
+    assert!(model.compute_auto_gen_paths().0.is_empty(), "and it stays idempotent with unnamed objects about");
+}

@@ -671,6 +671,79 @@ impl Path {
             point.radius *= scalar;
         }
     }
+
+    /// Adopts `new`'s parent and point geometry, keeping this path's name and, where the point
+    /// counts line up, the per-point turret assignments. Those assignments aren't editable in the
+    /// GUI but do round trip through the file, so regenerating a path mustn't silently drop them.
+    pub fn take_geometry_from(&mut self, mut new: Path) {
+        for (old_point, new_point) in self.points.iter_mut().zip(&mut new.points) {
+            new_point.turrets = std::mem::take(&mut old_point.turrets);
+        }
+        self.parent = new.parent;
+        self.points = new.points;
+    }
+}
+
+/// A model object which an auto-generated path can belong to. The variant order is the order
+/// `Model::path_targets` yields them in, which is the order paths get generated in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PathTarget {
+    Turret(usize),
+    Submodel(SubmodelId),
+    SpecialPoint(usize),
+    DockingBay(usize),
+}
+
+impl Display for PathTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            PathTarget::Turret(idx) => write!(f, "Turret {}", idx + 1),
+            PathTarget::Submodel(id) => write!(f, "Submodel {}", id.0),
+            PathTarget::SpecialPoint(idx) => write!(f, "Special Point {}", idx + 1),
+            PathTarget::DockingBay(idx) => write!(f, "Bay {}", idx + 1),
+        }
+    }
+}
+
+/// The number out of a `$pathNN` style name, if it has one.
+pub fn path_name_number(name: &str) -> Option<u32> {
+    name.strip_prefix("$path").or_else(|| name.strip_prefix("$Path"))?.parse().ok()
+}
+
+/// Hands out unique `$pathNN` names. Seed one with `Model::path_name_gen()`. The counter lives in
+/// the value rather than in a closure, so this works for generating a single name as well as a
+/// whole batch of them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PathNameGen {
+    max: u32,
+}
+
+impl PathNameGen {
+    /// Bumps the counter past `name`, if `name` is a `$pathNN` style name.
+    pub fn observe(&mut self, name: &str) {
+        if let Some(num) = path_name_number(name) {
+            if num > self.max {
+                self.max = num;
+            }
+        }
+    }
+
+    /// The next unused `$pathNN` name.
+    pub fn next_name(&mut self) -> String {
+        self.max += 1;
+        format!("$path{:02}", self.max)
+    }
+}
+
+/// A name reduced to what matching cares about, the way FSO resolves one: a leading '$' is ignored
+/// (special point names carry one, submodel names don't) and case is not significant.
+fn normalized_path_name(name: &str) -> String {
+    name.strip_prefix('$').unwrap_or(name).to_ascii_lowercase()
+}
+
+/// Whether a path's `parent` field refers to the object named `name`.
+pub fn path_parent_matches(parent: &str, name: &str) -> bool {
+    normalized_path_name(parent) == normalized_path_name(name)
 }
 
 #[derive(Debug, Clone)]
@@ -2388,6 +2461,297 @@ impl Model {
         }
     }
 
+    /// A `$pathNN` name allocator seeded past every such name already in the model.
+    pub fn path_name_gen(&self) -> PathNameGen {
+        let mut names = PathNameGen::default();
+        for path in &self.paths {
+            names.observe(&path.name);
+        }
+        names
+    }
+
+    /// Every object which can own an auto-generated path, in generation order: turrets, then
+    /// `$special=subsystem` submodels which aren't a turret base, then `$special=subsystem` special
+    /// points, then docking bays. Says nothing about whether a path already exists for them.
+    ///
+    /// Non subsystem submodels and special points are left out, which is what PCS2 did, and a
+    /// turret base submodel is only ever represented by its turret - the two use different
+    /// geometry, and the turret's is the correct one.
+    pub fn path_targets(&self) -> Vec<PathTarget> {
+        let turrets = (0..self.turrets.len()).map(PathTarget::Turret);
+        let submodels = self.submodels.iter().map(|smodel| PathTarget::Submodel(smodel.id));
+        let spcls = (0..self.special_points.len()).map(PathTarget::SpecialPoint);
+        let bays = (0..self.docking_bays.len()).map(PathTarget::DockingBay);
+
+        turrets
+            .chain(submodels)
+            .chain(spcls)
+            .chain(bays)
+            // canonical_path_target is what drops a turret base submodel, which its turret stands for
+            .filter(|&target| self.canonical_path_target(target) == target && self.can_own_a_path(target))
+            .collect()
+    }
+
+    /// Whether FSO would hand this object a path at all: turrets and docking bays always, submodels
+    /// and special points only when flagged `$special=subsystem`. Also false for an index which is
+    /// out of range.
+    ///
+    /// This is the one definition of what can own a path. `path_targets` and `name_matched_targets`
+    /// both filter through it rather than restating the rule, so they cannot drift apart - which is
+    /// how a decorative object once came to lay claim to a subsystem's path.
+    pub fn can_own_a_path(&self, target: PathTarget) -> bool {
+        // a path points at its object by name, so an unnamed one can't be given a path which
+        // resolves back to it - and generating one anyway would be generating it again every time
+        let named = |name: &str| !normalized_path_name(name).is_empty();
+
+        match target {
+            // a turret answers to its base submodel's name, and needs one for the same reason
+            PathTarget::Turret(idx) => self
+                .turrets
+                .get(idx)
+                .and_then(|turret| self.submodels.get(turret.base_model.0 as usize))
+                .is_some_and(|base| named(&base.name)),
+            PathTarget::Submodel(id) => self.submodels.get(id.0 as usize).is_some_and(|s| s.is_subsystem() && named(&s.name)),
+            PathTarget::SpecialPoint(idx) => self.special_points.get(idx).is_some_and(|s| s.is_subsystem() && named(&s.name)),
+            // a bay is claimed through its index link, and its parent string is synthesized
+            PathTarget::DockingBay(idx) => idx < self.docking_bays.len(),
+        }
+    }
+
+    /// Rewrites a target into the one `path_targets` would have yielded for the same object, i.e.
+    /// turns a turret base submodel into its turret.
+    pub fn canonical_path_target(&self, target: PathTarget) -> PathTarget {
+        if let PathTarget::Submodel(id) = target {
+            if let Some(idx) = self.turrets.iter().position(|turret| turret.base_model == id) {
+                return PathTarget::Turret(idx);
+            }
+        }
+        target
+    }
+
+    /// Every target a path `parent` string resolves to, in precedence order, canonical and filtered
+    /// through `can_own_a_path` - so this yields exactly the objects `path_targets` would, narrowed
+    /// to those the name picks out. It gives more than one only when a name is ambiguous, whether
+    /// that is two subsystems of different kinds or two of the same kind.
+    ///
+    /// Docking bays never appear: a generated dock path's parent is a synthesized `$dockNN-01`
+    /// string which deliberately names no object.
+    fn name_matched_targets(&self, parent: &str) -> impl Iterator<Item = PathTarget> {
+        let turrets = self
+            .turrets
+            .iter()
+            .positions(|turret| path_parent_matches(parent, &self.submodels[turret.base_model].name))
+            .map(PathTarget::Turret);
+        let spcls = self
+            .special_points
+            .iter()
+            .positions(|spcl| path_parent_matches(parent, &spcl.name))
+            .map(PathTarget::SpecialPoint);
+        let smodels = self
+            .submodels
+            .iter()
+            .filter(|smodel| path_parent_matches(parent, &smodel.name))
+            .map(|smodel| self.canonical_path_target(PathTarget::Submodel(smodel.id)));
+
+        // every match, not just the first of each kind - two objects of the same kind sharing a name
+        // both lay claim to the path, so it comes out contested rather than one of them owning it by
+        // accident of iteration order. Collected because the caller must not borrow the model.
+        let matched: Vec<_> = turrets.chain(spcls).chain(smodels).filter(|&target| self.can_own_a_path(target)).collect();
+        matched.into_iter()
+    }
+
+    /// Every object laying claim to this path: any docking bay whose index link points at it, plus
+    /// whatever its parent name resolves to. Normally there is exactly one.
+    ///
+    /// A turret and its base submodel are the same object here, reported as the turret, so an
+    /// ordinary turret path has one claimant rather than two.
+    pub fn path_claimants(&self, path: PathId) -> Vec<PathTarget> {
+        let Some(parent) = self.paths.get(path.0 as usize).map(|path| &path.parent) else {
+            return vec![];
+        };
+
+        let bays = self.docking_bays.iter().positions(|dock| dock.path == Some(path)).map(PathTarget::DockingBay);
+        let named = self.name_matched_targets(parent);
+
+        // a BTreeSet because the same object can be named more than one way, and because callers
+        // want a stable order to show the user
+        bays.chain(named).collect::<BTreeSet<_>>().into_iter().collect()
+    }
+
+    /// Whether more than one object lays claim to this path. FSO copes - it follows a bay's index
+    /// link and separately hands a subsystem the first path matching its name - but the claimants
+    /// are then sharing one path, so regenerating it for either would reshape the other's.
+    pub fn path_is_contested(&self, path: PathId) -> bool {
+        self.path_claimants(path).len() > 1
+    }
+
+    /// The targets which `compute_auto_gen_paths` considers already taken care of.
+    fn covered_path_targets(&self) -> BTreeSet<PathTarget> {
+        let mut covered = BTreeSet::new();
+        // docks are covered via their index link, so a dock whose link dangles still counts
+        covered.extend(self.docking_bays.iter().positions(|dock| dock.path.is_some()).map(PathTarget::DockingBay));
+        for path in &self.paths {
+            covered.extend(self.name_matched_targets(&path.parent));
+        }
+        covered
+    }
+
+    /// The name an auto-generated path for `target` puts in its `parent` field. `None` for docking
+    /// bays, whose parent string is synthesized rather than being a real object's name.
+    pub fn target_parent_name(&self, target: PathTarget) -> Option<&str> {
+        match target {
+            PathTarget::Turret(idx) => Some(&self.submodels[self.turrets[idx].base_model].name),
+            PathTarget::Submodel(id) => Some(&self.submodels[id].name),
+            PathTarget::SpecialPoint(idx) => Some(&self.special_points[idx].name),
+            PathTarget::DockingBay(_) => None,
+        }
+    }
+
+    /// A human readable label for `target`, using the object's own name where it has one.
+    pub fn path_target_label(&self, target: PathTarget) -> String {
+        match self.target_parent_name(target) {
+            Some(name) => name.to_string(),
+            None => format!("{}", target),
+        }
+    }
+
+    /// Builds the path the PCS2 derived heuristics want for `target`.
+    ///
+    /// Panics if the target's index is out of range for this model, as would indexing the model
+    /// with it directly.
+    pub fn gen_path_for(&self, target: PathTarget, name: String) -> Path {
+        match target {
+            PathTarget::Turret(idx) => {
+                let turret = &self.turrets[idx];
+                let base = &self.submodels[turret.base_model];
+                let offset = self.get_total_submodel_offset(turret.base_model);
+                let r = base.radius;
+                let r0 = (r * 30.0_f32).min(1000.0);
+                let r1 = (r * 2.0_f32).min(100.0);
+                let n = turret.normal.0;
+                Path {
+                    name,
+                    parent: base.name.clone(),
+                    points: vec![
+                        PathPoint {
+                            position: offset + n * (r0 * 1.2),
+                            radius: r0,
+                            turrets: vec![],
+                        },
+                        PathPoint {
+                            position: offset + n * (r * 4.0),
+                            radius: r1,
+                            turrets: vec![],
+                        },
+                    ],
+                }
+            }
+            PathTarget::Submodel(id) => {
+                let smodel = &self.submodels[id];
+                let offset = self.get_total_submodel_offset(id);
+                let r = smodel.radius;
+                let r0 = (r * 30.0_f32).min(1000.0);
+                let r1 = (r * 2.0_f32).min(100.0);
+                let n = if offset.is_null() {
+                    Vec3d::new(0.0, 1.0, 0.0)
+                } else {
+                    offset.normalize()
+                };
+                Path {
+                    name,
+                    parent: smodel.name.clone(),
+                    points: vec![
+                        PathPoint {
+                            position: offset + n * (r0 * 1.2),
+                            radius: r0,
+                            turrets: vec![],
+                        },
+                        PathPoint {
+                            position: offset + n * (r * 4.0),
+                            radius: r1,
+                            turrets: vec![],
+                        },
+                    ],
+                }
+            }
+            PathTarget::SpecialPoint(idx) => {
+                let spcl = &self.special_points[idx];
+                let pos = spcl.position;
+                let r = spcl.radius;
+                let r0 = (r * 6.0_f32).min(1000.0);
+                let r1 = (r * 0.3_f32).min(100.0);
+                let n = if pos.is_null() { Vec3d::new(0.0, 1.0, 0.0) } else { pos.normalize() };
+                Path {
+                    name,
+                    parent: spcl.name.clone(),
+                    points: vec![
+                        PathPoint { position: pos + n * (r0 * 1.2), radius: r0, turrets: vec![] },
+                        PathPoint { position: pos + n * (r * 0.9), radius: r1, turrets: vec![] },
+                    ],
+                }
+            }
+            PathTarget::DockingBay(bay_idx) => {
+                let dock = &self.docking_bays[bay_idx];
+                let fvec = dock.fvec.0;
+                let pos = dock.position;
+                Path {
+                    name,
+                    // FSO format: $dock{XX}-{YY}, XX = bay index (1-based), YY = path slot within bay (1-based).
+                    // We always generate one path per dock, so the slot is always 01.
+                    // Docks link to their paths by index rather than by name, so this is purely descriptive,
+                    // and FSO expects it *not* to resolve to a submodel - see the dockpoint checks in modelread.cpp
+                    parent: format!("$dock{:02}-01", bay_idx + 1),
+                    points: vec![
+                        PathPoint {
+                            position: pos + fvec * 500.0,
+                            radius: 1000.0,
+                            turrets: vec![],
+                        },
+                        PathPoint { position: pos + fvec * 100.0, radius: 100.0, turrets: vec![] },
+                        PathPoint { position: pos + fvec * 15.0, radius: 10.0, turrets: vec![] },
+                        PathPoint { position: pos + fvec * 2.0, radius: 1.0, turrets: vec![] },
+                    ],
+                }
+            }
+        }
+    }
+
+    /// Every existing path `target` lays claim to, in index order. Only the first is live in FSO,
+    /// which stops at the first match when assigning subsystem paths, so the rest are dead weight.
+    pub fn paths_for(&self, target: PathTarget) -> Vec<PathId> {
+        let target = self.canonical_path_target(target);
+        (0..self.paths.len())
+            .map(|idx| PathId(idx as u32))
+            .filter(|&id| self.path_claimants(id).contains(&target))
+            .collect()
+    }
+
+    /// The one path FSO would actually use for `target`.
+    ///
+    /// Note that `path_target(first_path_for(t))` isn't guaranteed to be `t` again on a malformed
+    /// model - two objects may share a name, or a dock's link may point at a named path. Use
+    /// `path_is_contested` to tell whether that has happened.
+    pub fn first_path_for(&self, target: PathTarget) -> Option<PathId> {
+        let target = self.canonical_path_target(target);
+        (0..self.paths.len()).map(|idx| PathId(idx as u32)).find(|&id| self.path_claimants(id).contains(&target))
+    }
+
+    /// The object an existing path belongs to, if any. Returns `None` for a path whose parent
+    /// matches nothing, which is perfectly legitimate - hand authored parents, cleared dock links,
+    /// and pre-2002 POFs which don't even serialize the parent field all land here.
+    ///
+    /// A dock's index link wins over any name match, since that link is what FSO actually follows;
+    /// the `$dockNN-01` parent string is only descriptive and is deliberately not parsed back.
+    pub fn path_target(&self, path: PathId) -> Option<PathTarget> {
+        let parent = &self.paths.get(path.0 as usize)?.parent;
+
+        if let Some(bay_idx) = self.docking_bays.iter().position(|dock| dock.path == Some(path)) {
+            return Some(PathTarget::DockingBay(bay_idx));
+        }
+
+        self.name_matched_targets(parent).next()
+    }
+
     /// Computes paths to auto-generate for all turrets, `$special=subsystem` submodels,
     /// `$special=subsystem` special points, and docking bays not already covered by an
     /// existing path. Returns `(new_paths_to_append, dock_bay_assignments)`.
@@ -2396,183 +2760,25 @@ impl Model {
     pub fn compute_auto_gen_paths(&self) -> (Vec<Path>, Vec<(usize, PathId)>) {
         let mut new_paths: Vec<Path> = Vec::new();
         let mut dock_assignments: Vec<(usize, PathId)> = Vec::new();
+        let mut names = self.path_name_gen();
+        let mut covered = self.covered_path_targets();
 
-        // Find the highest $pathNN number already in use
-        let mut max_path = 0u32;
-        for path in &self.paths {
-            let name = path.name.as_str();
-            let suffix = name.strip_prefix("$path").or_else(|| name.strip_prefix("$Path"));
-            if let Some(num_str) = suffix {
-                if let Ok(n) = num_str.parse::<u32>() {
-                    if n > max_path {
-                        max_path = n;
-                    }
-                }
-            }
-        }
-
-        // Build maps... normalized object name to index
-        let mut sobj_name_to_turret_idx: HashMap<String, usize> = HashMap::new();
-        for (i, turret) in self.turrets.iter().enumerate() {
-            let base_name = normalize_path_parent(&self.submodels[turret.base_model].name);
-            sobj_name_to_turret_idx.insert(base_name, i);
-        }
-
-        let sobj_name_map: HashMap<String, usize> = self.submodels.iter().map(|s| (normalize_path_parent(&s.name), s.id.0 as usize)).collect();
-
-        let spcl_name_map: HashMap<String, usize> =
-            self.special_points.iter().enumerate().map(|(i, s)| (normalize_path_parent(&s.name), i)).collect();
-
-        // Track which objects already have paths (true = skip)
-        let mut turret_has_path = vec![false; self.turrets.len()];
-        let mut smodel_has_path = vec![false; self.submodels.len()];
-        let mut spcl_has_path = vec![false; self.special_points.len()];
-
-        // Skip non subsystem submodels and special points, which is what PCS2 did
-        // is_subsystem() actually parses the properties field, so it also catches the separators
-        // FSO accepts, like "$special: subsystem", which a plain substring match would miss
-        for (i, sobj) in self.submodels.iter().enumerate() {
-            if !sobj.is_subsystem() {
-                smodel_has_path[i] = true;
-            }
-        }
-        for (i, spcl) in self.special_points.iter().enumerate() {
-            if !spcl.is_subsystem() {
-                spcl_has_path[i] = true;
-            }
-        }
-
-        // Mark objects already covered by an existing path's parent field
-        for path in &self.paths {
-            let parent = normalize_path_parent(&path.parent);
-            if let Some(&ti) = sobj_name_to_turret_idx.get(&parent) {
-                turret_has_path[ti] = true;
-            }
-            if let Some(&si) = spcl_name_map.get(&parent) {
-                spcl_has_path[si] = true;
-            }
-            if let Some(&oi) = sobj_name_map.get(&parent) {
-                smodel_has_path[oi] = true;
-            }
-        }
-
-        // return next unique $pathNN name
-        let mut next_name = || {
-            max_path += 1;
-            format!("$path{:02}", max_path)
-        };
-
-        // --- Turrets ---
-        for (i, turret) in self.turrets.iter().enumerate() {
-            if turret_has_path[i] {
+        for target in self.path_targets() {
+            if covered.contains(&target) {
                 continue;
             }
-            let base = &self.submodels[turret.base_model];
-            let offset = self.get_total_submodel_offset(turret.base_model);
-            let r = base.radius;
-            let r0 = (r * 30.0_f32).min(1000.0);
-            let r1 = (r * 2.0_f32).min(100.0);
-            let n = turret.normal.0;
-            new_paths.push(Path {
-                name: next_name(),
-                parent: base.name.clone(),
-                points: vec![
-                    PathPoint {
-                        position: offset + n * (r0 * 1.2),
-                        radius: r0,
-                        turrets: vec![],
-                    },
-                    PathPoint {
-                        position: offset + n * (r * 4.0),
-                        radius: r1,
-                        turrets: vec![],
-                    },
-                ],
-            });
-            // Mark the base_obj as covered so a submodel path is not also generated for it
-            smodel_has_path[turret.base_model.0 as usize] = true;
-        }
-
-        // --- Submodels ($special=subsystem only, not already covered by a turret path) ---
-        for sobj in self.submodels.iter() {
-            let idx = sobj.id.0 as usize;
-            if smodel_has_path[idx] {
-                continue;
+            if let PathTarget::DockingBay(bay_idx) = target {
+                dock_assignments.push((bay_idx, PathId((self.paths.len() + new_paths.len()) as u32)));
             }
-            let offset = self.get_total_submodel_offset(sobj.id);
-            let r = sobj.radius;
-            let r0 = (r * 30.0_f32).min(1000.0);
-            let r1 = (r * 2.0_f32).min(100.0);
-            let n = if offset.is_null() {
-                Vec3d::new(0.0, 1.0, 0.0)
-            } else {
-                offset.normalize()
-            };
-            new_paths.push(Path {
-                name: next_name(),
-                parent: sobj.name.clone(),
-                points: vec![
-                    PathPoint {
-                        position: offset + n * (r0 * 1.2),
-                        radius: r0,
-                        turrets: vec![],
-                    },
-                    PathPoint {
-                        position: offset + n * (r * 4.0),
-                        radius: r1,
-                        turrets: vec![],
-                    },
-                ],
-            });
-        }
+            let path = self.gen_path_for(target, names.next_name());
 
-        // --- Special points ($special=subsystem only) ---
-        for (i, spcl) in self.special_points.iter().enumerate() {
-            if spcl_has_path[i] {
-                continue;
-            }
-            let pos = spcl.position;
-            let r = spcl.radius;
-            let r0 = (r * 6.0_f32).min(1000.0);
-            let r1 = (r * 0.3_f32).min(100.0);
-            let n = if pos.is_null() { Vec3d::new(0.0, 1.0, 0.0) } else { pos.normalize() };
-            new_paths.push(Path {
-                name: next_name(),
-                parent: spcl.name.clone(),
-                points: vec![
-                    PathPoint { position: pos + n * (r0 * 1.2), radius: r0, turrets: vec![] },
-                    PathPoint { position: pos + n * (r * 0.9), radius: r1, turrets: vec![] },
-                ],
-            });
-        }
+            // a new path is claimed by everything its parent names, not just by the target it was
+            // generated for, so two subsystems sharing a name get one path between them - which is
+            // all FSO would use anyway - rather than one each which then contest each other
+            covered.extend(self.name_matched_targets(&path.parent));
+            covered.insert(target);
 
-        // --- Docking bays (those without a path assigned) ---
-        for (bay_idx, dock) in self.docking_bays.iter().enumerate() {
-            if dock.path.is_some() {
-                continue;
-            }
-            let fvec = dock.fvec.0;
-            let pos = dock.position;
-            let path_id = PathId((self.paths.len() + new_paths.len()) as u32);
-            new_paths.push(Path {
-                name: next_name(),
-                // FSO format: $dock{XX}-{YY}, XX = bay index (1-based), YY = path slot within bay (1-based).
-                // We always generate one path per dock, so the slot is always 01.
-                // Docks link to their paths by index rather than by name, so this is purely descriptive,
-                // and FSO expects it *not* to resolve to a submodel - see the dockpoint checks in modelread.cpp
-                parent: format!("$dock{:02}-01", bay_idx + 1),
-                points: vec![
-                    PathPoint {
-                        position: pos + fvec * 500.0,
-                        radius: 1000.0,
-                        turrets: vec![],
-                    },
-                    PathPoint { position: pos + fvec * 100.0, radius: 100.0, turrets: vec![] },
-                    PathPoint { position: pos + fvec * 15.0, radius: 10.0, turrets: vec![] },
-                    PathPoint { position: pos + fvec * 2.0, radius: 1.0, turrets: vec![] },
-                ],
-            });
-            dock_assignments.push((bay_idx, path_id));
+            new_paths.push(path);
         }
 
         (new_paths, dock_assignments)
@@ -3127,13 +3333,6 @@ pub fn post_parse_fill_untextured_slot(sub_objects: &mut Vec<Submodel>, textures
     } else {
         None
     }
-}
-
-/// Normalizes a name for the purposes of matching a path's parent against a submodel or
-/// special point, mirroring how FSO resolves it: the leading '$' is stripped (special point
-/// names carry one, submodel names don't) and the comparison is case insensitive.
-pub fn normalize_path_parent(name: &str) -> String {
-    name.strip_prefix('$').unwrap_or(name).to_ascii_lowercase()
 }
 
 pub fn properties_delete_field(properties: &mut String, field: &str) {
