@@ -12,6 +12,7 @@ use itertools::Itertools;
 use byteorder::{WriteBytesExt, LE};
 pub use dae_parser::UpAxis;
 use glm::{TMat3, TMat4, Vec3};
+use log::warn;
 use nalgebra::Matrix3;
 use nalgebra_glm::Mat4;
 extern crate nalgebra_glm as glm;
@@ -2384,6 +2385,21 @@ impl Model {
                 if path_num.0 >= inserted_idx as u32 {
                     bay.path = Some(PathId(path_num.0 + 1));
                 }
+            }
+        }
+    }
+
+    /// Clears every docking bay link which points past the end of the path list.
+    ///
+    /// A link is an index, so one which resolves to nothing on load doesn't stay harmless: add a
+    /// path and it starts resolving to whichever one lands on it. Every loader owes the rest of the
+    /// program this call, so the invariant holds from load onwards rather than being worked around.
+    pub fn sanitize_dock_paths(&mut self) {
+        let path_count = self.paths.len();
+        for dock in &mut self.docking_bays {
+            if dock.path.is_some_and(|id| id.0 as usize >= path_count) {
+                dock.path = None;
+                warn!("Invalid dock path on {:?} reset", dock.get_name());
             }
         }
     }
