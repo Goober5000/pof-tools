@@ -1675,10 +1675,24 @@ impl PofToolsGui {
                                     str.is_none() || str.unwrap() != self.model.pof_model.submodels[deleted_id].name
                                 });
 
-                                self.model
+                                // dropping paths shifts every later index, and docking bays link to
+                                // their path by index - so tell the bays about each removal, highest
+                                // first, or they end up pointing at the wrong path or past the end
+                                let doomed_name = format!("${}", self.model.pof_model.submodels[deleted_id].name);
+                                let doomed_paths: Vec<PathId> = self
+                                    .model
                                     .pof_model
                                     .paths
-                                    .retain(|path| format!("${}", self.model.pof_model.submodels[deleted_id].name) != path.name);
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, path)| path.name == doomed_name)
+                                    .map(|(idx, _)| PathId(idx as u32))
+                                    .collect();
+
+                                self.model.pof_model.paths.retain(|path| path.name != doomed_name);
+                                for &removed in doomed_paths.iter().rev() {
+                                    self.model.pof_model.path_removal_fixup(removed);
+                                }
 
                                 let mut buffer_mesh = Some(self.model.buffer_meshes.remove(index));
                                 let mut matrix = Some(self.model.submodel_transform_matrix.remove(index));

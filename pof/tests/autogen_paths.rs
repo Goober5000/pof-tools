@@ -680,6 +680,48 @@ fn nothing_unnamed_can_own_a_path() {
     assert!(model.compute_auto_gen_paths().0.is_empty(), "and it stays idempotent with unnamed objects about");
 }
 
+/// Mirrors what deleting a submodel does to the path list: drop the paths named after it, then tell
+/// the docking bays which indices went away.
+fn delete_paths_named(model: &mut Model, doomed_name: &str) {
+    let doomed: Vec<PathId> = model
+        .paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| path.name == doomed_name)
+        .map(|(idx, _)| PathId(idx as u32))
+        .collect();
+
+    model.paths.retain(|path| path.name != doomed_name);
+    for &removed in doomed.iter().rev() {
+        model.path_removal_fixup(removed);
+    }
+}
+
+#[test]
+fn dropping_paths_keeps_docking_bay_links_pointing_at_the_right_path() {
+    let mut model = base_model();
+    model.paths.push(Path { name: "$turret01".into(), parent: "turret01".into(), points: vec![] });
+    model.paths.push(Path { name: "$path02".into(), parent: "$dock01-01".into(), points: vec![] });
+    model.paths.push(Path { name: "$path03".into(), parent: "$dock02-01".into(), points: vec![] });
+
+    model.docking_bays.push(Dock { path: Some(PathId(1)), ..Default::default() });
+    model.docking_bays.push(Dock { path: Some(PathId(2)), ..Default::default() });
+    // a bay pointing at the path which is about to go
+    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
+
+    delete_paths_named(&mut model, "$turret01");
+
+    assert_eq!(parents(&model.paths), vec!["$dock01-01", "$dock02-01"]);
+    assert_eq!(model.docking_bays[0].path, Some(PathId(0)), "shifted down with its path");
+    assert_eq!(model.docking_bays[1].path, Some(PathId(1)), "shifted down with its path");
+    assert_eq!(model.docking_bays[2].path, None, "its path is gone, so it has none");
+
+    // and the claim model agrees, rather than reading a stale index as an unclaimed bay
+    assert_eq!(model.first_path_for(PathTarget::DockingBay(0)), Some(PathId(0)));
+    assert_eq!(model.first_path_for(PathTarget::DockingBay(1)), Some(PathId(1)));
+    assert!(model.compute_auto_gen_paths().0.iter().all(|path| path.parent != "$dock01-01"), "no duplicate for bay 0");
+}
+
 #[test]
 fn a_rename_refreshes_every_warning_which_spans_two_objects() {
     // what an edit widget runs: the warnings a rename can invalidate from a distance, without the
