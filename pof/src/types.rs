@@ -3125,41 +3125,41 @@ pub fn post_parse_fill_untextured_slot(sub_objects: &mut Vec<Submodel>, textures
 }
 
 pub fn properties_delete_field(properties: &mut String, field: &str) {
-    if let Some(start_idx) = properties.find(field) {
-        let mut end_idx = if let Some(idx) = properties[start_idx..].chars().position(|d| d.is_ascii_control()) {
-            start_idx + idx
-        } else {
-            start_idx + properties[start_idx..].len()
-        };
+    if let (Some(field_idx), Some((_, value_end))) = (properties.find(field), properties_find_field(properties, field)) {
+        // take the line break after the value along with it, instead of leaving a blank line behind
+        let next_line = value_end + byte_offset_of_first(&properties[value_end..], |c| !c.is_ascii_control());
 
-        let mut chars = properties[start_idx..].chars();
-        while end_idx < properties.len() && chars.next().unwrap().is_ascii_control() {
-            end_idx += 1;
-        }
-
-        *properties = format!("{}{}", &properties[..start_idx], &properties[end_idx..]).trim().to_string();
+        *properties = format!("{}{}", &properties[..field_idx], &properties[next_line..]).trim().to_string();
     }
 }
 
+/// The byte offset of the first char of `s` satisfying `pred`, or the length of `s` if there is none.
+///
+/// A byte offset, not a char index - `chars().position()` gives the latter, and adding one of those
+/// to a byte index goes quietly wrong as soon as a property contains a non ASCII character.
+fn byte_offset_of_first(s: &str, mut pred: impl FnMut(char) -> bool) -> usize {
+    s.char_indices().find(|&(_, c)| pred(c)).map_or(s.len(), |(idx, _)| idx)
+}
+
+/// What may sit between a field name and its value. FSO's get_user_prop_value skips '=', ':' and
+/// whitespace; a newline ends the line, so it is never part of the separator.
+fn is_field_separator(c: char) -> bool {
+    c == '=' || c == ':' || (c.is_whitespace() && c != '\n')
+}
+
+/// The byte range of the value belonging to `field`, if the field is present at all.
 fn properties_find_field(properties: &str, field: &str) -> Option<(usize, usize)> {
-    if let Some(mut start_idx) = properties.find(field) {
-        let end_idx = if let Some(idx) = properties[start_idx..].chars().position(|d| d.is_ascii_control()) {
-            start_idx + idx
-        } else {
-            properties.len()
-        };
+    let after_field = properties.find(field)? + field.len();
 
-        start_idx += field.len();
+    // skip whatever separates the field name from its value...
+    let value_start = after_field + byte_offset_of_first(&properties[after_field..], |c| !is_field_separator(c));
 
-        let mut chars = properties[start_idx..].chars();
-        while chars.next().map_or(false, |c| c == '=' || c == ':' || (c.is_whitespace() && c != '\n')) {
-            start_idx += 1;
-        }
+    // ...then take the rest of the line. Measuring this from the value rather than from the field
+    // name matters: a tab is both a valid separator and a control character, so anchoring it at the
+    // field name ended the value before it had begun.
+    let value_end = value_start + byte_offset_of_first(&properties[value_start..], |c| c.is_ascii_control());
 
-        Some((start_idx, end_idx))
-    } else {
-        None
-    }
+    Some((value_start, value_end))
 }
 
 pub fn properties_update_field(properties: &mut String, field: &str, val: &str) {
