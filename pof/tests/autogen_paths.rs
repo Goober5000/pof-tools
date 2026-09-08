@@ -788,3 +788,45 @@ fn a_rename_refreshes_every_warning_which_spans_two_objects() {
     model.recheck_cross_object_warnings();
     assert_eq!((contested(&model), bad_parent(&model)), (0, 0));
 }
+
+/// Mirrors what deleting a submodel now selects for removal: the paths that submodel is the sole
+/// claimant of, rather than the ones merely named after it.
+fn paths_belonging_only_to(model: &Model, target: PathTarget) -> Vec<PathId> {
+    let target = model.canonical_path_target(target);
+    let index = model.path_name_index();
+    (0..model.paths.len())
+        .map(|idx| PathId(idx as u32))
+        .filter(|&id| model.path_claimants_with(&index, id) == vec![target])
+        .collect()
+}
+
+#[test]
+fn deleting_a_submodel_takes_its_own_path_and_not_its_namesake() {
+    let mut model = base_model();
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    // an unrelated dock path which merely happens to be named after the submodel
+    model.paths.push(Path { name: "$engine01".into(), parent: "$dock01-01".into(), points: vec![] });
+
+    let engine01 = PathTarget::Submodel(SubmodelId(1));
+    assert_eq!(parents(&model.paths), vec!["engine01", "$dock01-01"]);
+    assert_eq!(
+        paths_belonging_only_to(&model, engine01),
+        vec![PathId(0)],
+        "its own path, not the one called $engine01"
+    );
+
+    // a turret base resolves to its turret, whose path names the base
+    let mut model = turret_model();
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    assert_eq!(paths_belonging_only_to(&model, PathTarget::Submodel(SubmodelId(3))), vec![PathId(0)], "turret01's path");
+
+    // a path two objects answer to is left alone, rather than stranding the survivor
+    let mut model = base_model();
+    model.submodels.0.push(smodel(3, "engine01", "$special=subsystem", Vec3d::new(0.0, 0.0, 60.0), 8.0));
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    assert!(model.path_is_contested(PathId(0)));
+    assert!(paths_belonging_only_to(&model, PathTarget::Submodel(SubmodelId(1))).is_empty(), "shared, so not solely its own");
+}

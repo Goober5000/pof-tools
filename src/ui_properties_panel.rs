@@ -1626,6 +1626,19 @@ impl PofToolsGui {
                                 let mut docking_bays = self.model.docking_bays.clone();
                                 let mut paths = self.model.paths.clone();
 
+                                // the paths belonging to this submodel: the ones it is the sole
+                                // claimant of. Worked out here, before anything is pruned, so a
+                                // turret base still resolves to its turret - and one another object
+                                // also answers to is left alone rather than stranding that object.
+                                let doomed_target = self.model.canonical_path_target(PathTarget::Submodel(deleted_id));
+                                let doomed_paths: Vec<PathId> = {
+                                    let index = self.model.path_name_index();
+                                    (0..self.model.paths.len())
+                                        .map(|idx| PathId(idx as u32))
+                                        .filter(|&id| self.model.path_claimants_with(&index, id) == vec![doomed_target])
+                                        .collect()
+                                };
+
                                 self.model.header.num_submodels -= 1;
                                 let mut removed_detail = false;
                                 // truncate if a detail level was deleted
@@ -1682,19 +1695,8 @@ impl PofToolsGui {
                                 // dropping paths shifts every later index, and docking bays link to
                                 // their path by index - so tell the bays about each removal, highest
                                 // first, or they end up pointing at the wrong path or past the end
-                                let doomed_name = format!("${}", self.model.pof_model.submodels[deleted_id].name);
-                                let doomed_paths: Vec<PathId> = self
-                                    .model
-                                    .pof_model
-                                    .paths
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, path)| path.name == doomed_name)
-                                    .map(|(idx, _)| PathId(idx as u32))
-                                    .collect();
-
-                                self.model.pof_model.paths.retain(|path| path.name != doomed_name);
                                 for &removed in doomed_paths.iter().rev() {
+                                    self.model.pof_model.paths.remove(removed.0 as usize);
                                     self.model.pof_model.path_removal_fixup(removed);
                                 }
 
