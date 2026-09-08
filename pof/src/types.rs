@@ -2586,14 +2586,11 @@ impl Model {
     }
 
     /// The targets which `compute_auto_gen_paths` considers already taken care of.
+    ///
+    /// A docking bay is covered by its index link, and a link pointing past the end of the path list
+    /// claims nothing, so auto-gen repairs it rather than leaving an invalid index in the file.
     fn covered_path_targets(&self) -> BTreeSet<PathTarget> {
-        let mut covered = BTreeSet::new();
-        // docks are covered via their index link, so a dock whose link dangles still counts
-        covered.extend(self.docking_bays.iter().positions(|dock| dock.path.is_some()).map(PathTarget::DockingBay));
-        for path in &self.paths {
-            covered.extend(self.name_matched_targets(&path.parent));
-        }
-        covered
+        (0..self.paths.len()).flat_map(|idx| self.path_claimants(PathId(idx as u32))).collect()
     }
 
     /// The name an auto-generated path for `target` puts in its `parent` field. `None` for docking

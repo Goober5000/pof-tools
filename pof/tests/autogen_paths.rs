@@ -507,6 +507,19 @@ fn take_geometry_from_handles_gaining_points() {
     assert!(path.points[1].turrets.is_empty());
 }
 
+// ---------------------------------------------------------------- docking bay path conflicts
+
+#[test]
+fn auto_gen_repairs_a_dangling_dock_link() {
+    let mut model = base_model();
+    model.docking_bays.push(Dock { path: Some(PathId(7)), ..Default::default() });
+
+    // an index past the end of the path list isn't a path, so the bay is not treated as covered
+    let (paths, docks) = model.compute_auto_gen_paths();
+    assert_eq!(parents(&paths), vec!["engine01", "$dock01-01"]);
+    assert_eq!(docks, vec![(0, PathId(1))], "the bay is relinked to the path it just got");
+}
+
 #[test]
 fn an_empty_parent_names_nothing() {
     // every path in a POF older than version 20.02 has an empty parent, since the field isn't
