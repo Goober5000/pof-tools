@@ -790,6 +790,16 @@ pub fn model_action(undo_history: &mut undo::History<UndoAction>, model: &mut Mo
     model.recheck_errors(Set::All);
 }
 
+/// `model_action` for the value and text widgets, which fire on every keystroke and every step of a
+/// drag. A full recheck walks every vertex of every submodel, so instead this rechecks only the
+/// warnings these edits can invalidate from a distance - the ones about one object's relationship to
+/// another, which a rename anywhere can change. Warnings tied to the edited field itself are
+/// rechecked by the call site, as they always have been.
+pub fn model_edit_action(undo_history: &mut undo::History<UndoAction>, model: &mut Model, func: Box<dyn FnMut(&mut Model)>) {
+    let _ = undo_history.apply(model, UndoAction { function: func });
+    model.recheck_cross_object_warnings();
+}
+
 impl PofToolsGui {
     pub fn sanitize_ui_state(&mut self) {
         let (idx, len) = match self.tree_view_selection {
@@ -1134,6 +1144,10 @@ impl PofToolsGui {
                             });
                         }
 
+                        // this list redraws every frame, so build the claim index once for it rather
+                        // than once per contested path - and only if there turns out to be one
+                        let mut path_names = None;
+
                         for warning in &self.model.warnings {
                             let str = match warning {
                                 Warning::InvertedBBox(id_opt) => {
@@ -1146,11 +1160,22 @@ impl PofToolsGui {
                                     )
                                 }
                                 Warning::PathClaimedByMultipleObjects(idx) => {
+                                    let index = path_names.get_or_insert_with(|| self.model.path_name_index());
                                     let claimants = self
                                         .model
-                                        .path_claimants(PathId(*idx as u32))
+                                        .path_claimants_with(index, PathId(*idx as u32))
                                         .into_iter()
-                                        .map(|target| self.model.path_target_label(target))
+                                        .map(|target| {
+                                            // two objects sharing a name is the commonest way to end up
+                                            // here, and the name alone would read "engine01 and
+                                            // engine01" - say which of them each one is
+                                            let name = self.model.path_target_label(target);
+                                            if name == target.to_string() {
+                                                name
+                                            } else {
+                                                format!("{} ({})", name, target)
+                                            }
+                                        })
                                         .collect::<Vec<_>>();
                                     format!(
                                         "⚠ Path {} is claimed by {}, only one of them can use it",

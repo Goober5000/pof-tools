@@ -746,6 +746,30 @@ pub fn path_parent_matches(parent: &str, name: &str) -> bool {
     normalized_path_name(parent) == normalized_path_name(name)
 }
 
+/// The objects which can own a path, indexed by the name they answer to, so that a whole model's
+/// worth of paths can be resolved without rescanning every object for each one.
+///
+/// Built from `Model::path_targets`, so which objects appear and how many of them share a name both
+/// come from there rather than being restated - it is the same claim model, just turned inside out.
+/// Docking bays are absent: they are claimed through their index link, not by name.
+pub struct PathNameIndex {
+    by_name: HashMap<String, Vec<PathTarget>>,
+}
+
+impl PathNameIndex {
+    /// The targets a path `parent` string names, in `path_targets` order.
+    fn matches(&self, parent: &str) -> &[PathTarget] {
+        let name = normalized_path_name(parent);
+        // an empty parent names nothing rather than naming everything unnamed. Every path in a POF
+        // older than version 20.02 has one, since the field isn't written before then, and FSO
+        // doesn't resolve those either - it clears parent_name and leaves parent_submodel at -1.
+        if name.is_empty() {
+            return &[];
+        }
+        self.by_name.get(&name).map_or(&[], Vec::as_slice)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PolyVertex<T = NormalId> {
     pub vertex_id: VertexId,
@@ -2006,6 +2030,37 @@ impl Model {
         true
     }
 
+    /// Recomputes the warnings which are about one object's relationship to another - which objects
+    /// claim which paths, and whether a docking bay's `$parent_submodel` still names a submodel.
+    ///
+    /// These depend on names from all over the model, so a rename anywhere can invalidate one and
+    /// there is no single warning to recheck - but a full `recheck_warnings` walks every vertex of
+    /// every submodel to test radii and bounding boxes, far too much to repeat on every keystroke.
+    /// Anything else added here must be cheap for the same reason.
+    pub fn recheck_cross_object_warnings(&mut self) {
+        self.warnings
+            .retain(|warning| !matches!(warning, Warning::PathClaimedByMultipleObjects(_) | Warning::InvalidDockParentSubmodel(_)));
+
+        // one index for the whole sweep - resolving each path's claimants against the objects
+        // individually would make this rescan every object once per path
+        let index = self.path_name_index();
+        for i in 0..self.paths.len() {
+            if self.path_claimants_with(&index, PathId(i as u32)).len() > 1 {
+                self.warnings.insert(Warning::PathClaimedByMultipleObjects(i));
+            }
+        }
+
+        // a bay names its parent submodel in its properties, so renaming that submodel breaks the
+        // reference from a distance in exactly the way a path's parent does
+        for i in 0..self.docking_bays.len() {
+            let names_nothing = properties_get_field(&self.docking_bays[i].properties, "$parent_submodel")
+                .is_some_and(|name| self.get_model_id_by_name(name).is_none());
+            if names_nothing {
+                self.warnings.insert(Warning::InvalidDockParentSubmodel(i));
+            }
+        }
+    }
+
     // rechecks just one or all of the warnings on the model
     pub fn recheck_warnings(&mut self, warning_to_check: Set<Warning>) {
         if let Set::One(warning) = warning_to_check {
@@ -2138,9 +2193,6 @@ impl Model {
                     self.warnings.insert(Warning::DockingBayNameTooLong(i));
                 }
 
-                if properties_get_field(&dock.properties, "$parent_submodel").map_or(false, |name| self.get_model_id_by_name(name).is_none()) {
-                    self.warnings.insert(Warning::InvalidDockParentSubmodel(i));
-                }
             }
 
             for (i, bank) in self.thruster_banks.iter().enumerate() {
@@ -2202,11 +2254,9 @@ impl Model {
                 if path.name.len() > MAX_NAME_LEN {
                     self.warnings.insert(Warning::PathNameTooLong(i));
                 }
-
-                if self.path_is_contested(PathId(i as u32)) {
-                    self.warnings.insert(Warning::PathClaimedByMultipleObjects(i));
-                }
             }
+
+            self.recheck_cross_object_warnings();
 
             for duped_name in self.paths.iter().map(|path| &path.name).duplicates() {
                 self.warnings.insert(Warning::DuplicatePathName(duped_name.clone()));
@@ -2501,9 +2551,9 @@ impl Model {
     /// and special points only when flagged `$special=subsystem`. Also false for an index which is
     /// out of range.
     ///
-    /// This is the one definition of what can own a path. `path_targets` and `name_matched_targets`
-    /// both filter through it rather than restating the rule, so they cannot drift apart - which is
-    /// how a decorative object once came to lay claim to a subsystem's path.
+    /// This is the one definition of what can own a path: `path_targets` filters through it rather
+    /// than restating the rule, and name matching is built from `path_targets`, so the two cannot
+    /// drift apart - which is how a decorative object once came to lay claim to a subsystem's path.
     pub fn can_own_a_path(&self, target: PathTarget) -> bool {
         // a path points at its object by name, so an unnamed one can't be given a path which
         // resolves back to it - and generating one anyway would be generating it again every time
@@ -2534,35 +2584,20 @@ impl Model {
         target
     }
 
-    /// Every target a path `parent` string resolves to, in precedence order, canonical and filtered
-    /// through `can_own_a_path` - so this yields exactly the objects `path_targets` would, narrowed
-    /// to those the name picks out. It gives more than one only when a name is ambiguous, whether
-    /// that is two subsystems of different kinds or two of the same kind.
-    ///
-    /// Docking bays never appear: a generated dock path's parent is a synthesized `$dockNN-01`
-    /// string which deliberately names no object.
-    fn name_matched_targets(&self, parent: &str) -> impl Iterator<Item = PathTarget> {
-        let turrets = self
-            .turrets
-            .iter()
-            .positions(|turret| path_parent_matches(parent, &self.submodels[turret.base_model].name))
-            .map(PathTarget::Turret);
-        let spcls = self
-            .special_points
-            .iter()
-            .positions(|spcl| path_parent_matches(parent, &spcl.name))
-            .map(PathTarget::SpecialPoint);
-        let smodels = self
-            .submodels
-            .iter()
-            .filter(|smodel| path_parent_matches(parent, &smodel.name))
-            .map(|smodel| self.canonical_path_target(PathTarget::Submodel(smodel.id)));
-
-        // every match, not just the first of each kind - two objects of the same kind sharing a name
-        // both lay claim to the path, so it comes out contested rather than one of them owning it by
-        // accident of iteration order. Collected because the caller must not borrow the model.
-        let matched: Vec<_> = turrets.chain(spcls).chain(smodels).filter(|&target| self.can_own_a_path(target)).collect();
-        matched.into_iter()
+    /// Indexes every object which can own a path by the name it answers to. Resolving one path costs
+    /// a hash lookup afterwards, so anything which walks the whole model - coverage, the contested
+    /// warning, `first_path_for` - builds this once instead of rescanning the objects per path.
+    pub fn path_name_index(&self) -> PathNameIndex {
+        let mut by_name: HashMap<String, Vec<PathTarget>> = HashMap::new();
+        for target in self.path_targets() {
+            // docking bays have no name of their own, and are claimed through their index link
+            let Some(name) = self.target_parent_name(target).map(normalized_path_name) else { continue };
+            // an unnamed object answers to no parent string, rather than to every empty one
+            if !name.is_empty() {
+                by_name.entry(name).or_default().push(target);
+            }
+        }
+        PathNameIndex { by_name }
     }
 
     /// Every object laying claim to this path: any docking bay whose index link points at it, plus
@@ -2571,23 +2606,33 @@ impl Model {
     /// A turret and its base submodel are the same object here, reported as the turret, so an
     /// ordinary turret path has one claimant rather than two.
     pub fn path_claimants(&self, path: PathId) -> Vec<PathTarget> {
+        self.path_claimants_with(&self.path_name_index(), path)
+    }
+
+    /// `path_claimants` against an index the caller already built. Anything resolving more than one
+    /// path should go through these `_with` forms - the plain ones build an index per call.
+    pub fn path_claimants_with(&self, index: &PathNameIndex, path: PathId) -> Vec<PathTarget> {
         let Some(parent) = self.paths.get(path.0 as usize).map(|path| &path.parent) else {
             return vec![];
         };
 
         let bays = self.docking_bays.iter().positions(|dock| dock.path == Some(path)).map(PathTarget::DockingBay);
-        let named = self.name_matched_targets(parent);
 
         // a BTreeSet because the same object can be named more than one way, and because callers
         // want a stable order to show the user
-        bays.chain(named).collect::<BTreeSet<_>>().into_iter().collect()
+        bays.chain(index.matches(parent).iter().copied()).collect::<BTreeSet<_>>().into_iter().collect()
     }
 
     /// Whether more than one object lays claim to this path. FSO copes - it follows a bay's index
     /// link and separately hands a subsystem the first path matching its name - but the claimants
     /// are then sharing one path, so regenerating it for either would reshape the other's.
     pub fn path_is_contested(&self, path: PathId) -> bool {
-        self.path_claimants(path).len() > 1
+        self.path_is_contested_with(&self.path_name_index(), path)
+    }
+
+    /// `path_is_contested` against an index the caller already built.
+    pub fn path_is_contested_with(&self, index: &PathNameIndex, path: PathId) -> bool {
+        self.path_claimants_with(index, path).len() > 1
     }
 
     /// The targets which `compute_auto_gen_paths` considers already taken care of.
@@ -2595,7 +2640,8 @@ impl Model {
     /// A docking bay is covered by its index link, and a link pointing past the end of the path list
     /// claims nothing, so auto-gen repairs it rather than leaving an invalid index in the file.
     fn covered_path_targets(&self) -> BTreeSet<PathTarget> {
-        (0..self.paths.len()).flat_map(|idx| self.path_claimants(PathId(idx as u32))).collect()
+        let index = self.path_name_index();
+        (0..self.paths.len()).flat_map(|idx| self.path_claimants_with(&index, PathId(idx as u32))).collect()
     }
 
     /// The name an auto-generated path for `target` puts in its `parent` field. `None` for docking
@@ -2721,10 +2767,10 @@ impl Model {
     /// Every existing path `target` lays claim to, in index order. Only the first is live in FSO,
     /// which stops at the first match when assigning subsystem paths, so the rest are dead weight.
     pub fn paths_for(&self, target: PathTarget) -> Vec<PathId> {
-        let target = self.canonical_path_target(target);
+        let (target, index) = (self.canonical_path_target(target), self.path_name_index());
         (0..self.paths.len())
             .map(|idx| PathId(idx as u32))
-            .filter(|&id| self.path_claimants(id).contains(&target))
+            .filter(|&id| self.path_claimants_with(&index, id).contains(&target))
             .collect()
     }
 
@@ -2734,24 +2780,35 @@ impl Model {
     /// model - two objects may share a name, or a dock's link may point at a named path. Use
     /// `path_is_contested` to tell whether that has happened.
     pub fn first_path_for(&self, target: PathTarget) -> Option<PathId> {
+        self.first_path_for_with(&self.path_name_index(), target)
+    }
+
+    /// `first_path_for` against an index the caller already built. Resolving a whole model's worth
+    /// of targets through the plain form rebuilds the index once per target.
+    pub fn first_path_for_with(&self, index: &PathNameIndex, target: PathTarget) -> Option<PathId> {
         let target = self.canonical_path_target(target);
-        (0..self.paths.len()).map(|idx| PathId(idx as u32)).find(|&id| self.path_claimants(id).contains(&target))
+        (0..self.paths.len()).map(|idx| PathId(idx as u32)).find(|&id| self.path_claimants_with(index, id).contains(&target))
     }
 
     /// The object an existing path belongs to, if any. Returns `None` for a path whose parent
     /// matches nothing, which is perfectly legitimate - hand authored parents, cleared dock links,
-    /// and pre-2002 POFs which don't even serialize the parent field all land here.
+    /// and POFs older than version 20.02, which don't serialize the parent field at all, land here.
     ///
     /// A dock's index link wins over any name match, since that link is what FSO actually follows;
     /// the `$dockNN-01` parent string is only descriptive and is deliberately not parsed back.
     pub fn path_target(&self, path: PathId) -> Option<PathTarget> {
+        self.path_target_with(&self.path_name_index(), path)
+    }
+
+    /// `path_target` against an index the caller already built.
+    pub fn path_target_with(&self, index: &PathNameIndex, path: PathId) -> Option<PathTarget> {
         let parent = &self.paths.get(path.0 as usize)?.parent;
 
         if let Some(bay_idx) = self.docking_bays.iter().position(|dock| dock.path == Some(path)) {
             return Some(PathTarget::DockingBay(bay_idx));
         }
 
-        self.name_matched_targets(parent).next()
+        index.matches(parent).first().copied()
     }
 
     /// Computes paths to auto-generate for all turrets, `$special=subsystem` submodels,
@@ -2764,6 +2821,7 @@ impl Model {
         let mut dock_assignments: Vec<(usize, PathId)> = Vec::new();
         let mut names = self.path_name_gen();
         let mut covered = self.covered_path_targets();
+        let index = self.path_name_index();
 
         for target in self.path_targets() {
             if covered.contains(&target) {
@@ -2777,7 +2835,7 @@ impl Model {
             // a new path is claimed by everything its parent names, not just by the target it was
             // generated for, so two subsystems sharing a name get one path between them - which is
             // all FSO would use anyway - rather than one each which then contest each other
-            covered.extend(self.name_matched_targets(&path.parent));
+            covered.extend(index.matches(&path.parent).iter().copied());
             covered.insert(target);
 
             new_paths.push(path);

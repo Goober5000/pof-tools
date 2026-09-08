@@ -641,6 +641,8 @@ fn an_empty_parent_names_nothing() {
     assert_eq!(parents(&model.paths).last(), Some(&"engine01"));
     assert!(model.compute_auto_gen_paths().0.is_empty(), "still idempotent with an unnamed subsystem about");
 
+    model.recheck_warnings(Set::All);
+    assert!(model.warnings.iter().all(|warning| !matches!(warning, Warning::PathClaimedByMultipleObjects(_))));
 }
 
 #[test]
@@ -676,4 +678,32 @@ fn nothing_unnamed_can_own_a_path() {
     model.paths.extend(generated);
     assert_eq!(parents(&model.paths), vec!["engine01"]);
     assert!(model.compute_auto_gen_paths().0.is_empty(), "and it stays idempotent with unnamed objects about");
+}
+
+#[test]
+fn a_rename_refreshes_every_warning_which_spans_two_objects() {
+    // what an edit widget runs: the warnings a rename can invalidate from a distance, without the
+    // full sweep over every vertex of every submodel
+    let mut model = base_model();
+    model.submodels.0.push(smodel(3, "engine02", "$special=subsystem", Vec3d::new(0.0, 0.0, 60.0), 8.0));
+    model.docking_bays.push(Dock { properties: "$parent_submodel=hull".into(), ..Default::default() });
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    model.recheck_warnings(Set::All);
+
+    let contested = |m: &Model| m.warnings.iter().filter(|w| matches!(w, Warning::PathClaimedByMultipleObjects(_))).count();
+    let bad_parent = |m: &Model| m.warnings.iter().filter(|w| matches!(w, Warning::InvalidDockParentSubmodel(_))).count();
+    assert_eq!((contested(&model), bad_parent(&model)), (0, 0));
+
+    // one rename breaks both: engine02 now shares engine01's name, and nothing is called hull
+    model.submodels[SubmodelId(3)].name = "engine01".into();
+    model.submodels[SubmodelId(2)].name = "hull_renamed".into();
+    model.recheck_cross_object_warnings();
+    assert_eq!((contested(&model), bad_parent(&model)), (1, 1), "both are noticed without a full recheck");
+
+    // and putting the names back clears both again
+    model.submodels[SubmodelId(3)].name = "engine02".into();
+    model.submodels[SubmodelId(2)].name = "hull".into();
+    model.recheck_cross_object_warnings();
+    assert_eq!((contested(&model), bad_parent(&model)), (0, 0));
 }

@@ -18,9 +18,9 @@ use pof::{
 use crate::Model;
 
 use crate::ui::{
-    model_action, DockingTreeValue, EyeTreeValue, GlowTreeValue, InsigniaTreeValue, PathTreeValue, PofToolsGui, SpecialPointTreeValue,
-    SubmodelTreeValue, TextureTreeValue, ThrusterTreeValue, TreeValue, TurretTreeValue, UiState, UndoAction, WeaponTreeValue, ERROR_RED, LIGHT_BLUE,
-    LIGHT_ORANGE, WARNING_YELLOW,
+    model_action, model_edit_action, DockingTreeValue, EyeTreeValue, GlowTreeValue, InsigniaTreeValue, PathTreeValue, PofToolsGui,
+    SpecialPointTreeValue, SubmodelTreeValue, TextureTreeValue, ThrusterTreeValue, TreeValue, TurretTreeValue, UiState, UndoAction, WeaponTreeValue,
+    ERROR_RED, LIGHT_BLUE, LIGHT_ORANGE, WARNING_YELLOW,
 };
 
 const NON_BREAK_SPACE: char = '\u{00A0}';
@@ -129,8 +129,10 @@ fn path_gen_button(
     // reason for the tooltip, rather than each restating the rule and drifting from it
     let target = target.filter(|&target| model.can_own_a_path(target));
 
-    let existing = target.and_then(|target| model.first_path_for(target));
-    let contested = existing.is_some_and(|path| model.path_is_contested(path));
+    // one index between the two lookups, rather than each building its own
+    let index = model.path_name_index();
+    let existing = target.and_then(|target| model.first_path_for_with(&index, target));
+    let contested = existing.is_some_and(|path| model.path_is_contested_with(&index, path));
     let label = if existing.is_some() { "Regenerate Path" } else { "Generate Path" };
 
     let response = ui
@@ -288,10 +290,10 @@ fn text_edit_single(
                 swap(&mut old_val, val);
             }
         });
-        // model_action rather than applying to the undo history directly, so that warnings and
-        // errors get rechecked: anything derived from more than one object - two of them claiming
-        // one path, say - goes stale the moment one of the names behind it is edited here
-        model_action(undo_history, model, func);
+        // model_edit_action rather than applying to the undo history directly, so that the warnings
+        // which depend on other objects get rechecked: two of them claiming one path, say, goes
+        // stale the moment one of the names behind it is edited here
+        model_edit_action(undo_history, model, func);
     }
 
     egui::TextEdit::load_state(ui.ctx(), egui_id).unwrap().clear_undoer();
@@ -319,7 +321,7 @@ fn text_edit_multi(
                 swap(&mut old_val, val);
             }
         });
-        model_action(undo_history, model, func);
+        model_edit_action(undo_history, model, func);
     }
 
     egui::TextEdit::load_state(ui.ctx(), egui_id).unwrap().clear_undoer();
@@ -503,7 +505,7 @@ impl UiState {
             if response.changed() {
                 if let Ok(new_val) = parsable_string.parse::<T>() {
                     let func = model_func(model, new_val);
-                    model_action(undo_history, model, func);
+                    model_edit_action(undo_history, model, func);
 
                     *viewport_3d_dirty = true;
                 }
@@ -539,7 +541,7 @@ impl UiState {
                         info!("Modifying: {}", id);
                         swap(&mut new_val, val);
                     });
-                    model_action(undo_history, model, func);
+                    model_edit_action(undo_history, model, func);
 
                     *viewport_3d_dirty = true;
                 }
@@ -3191,8 +3193,8 @@ impl PofToolsGui {
                 let mut idx = 0;
                 if let Some(point) = point_num {
                     if let Some(type_str) = pof::properties_get_field(&self.model.special_points[point].properties, "$special") {
-                        // matched the way is_subsystem and FSO's string_lookup do, so "$special=Subsystem" doesn't show a
-                        // blank type next to a path button which considers it a subsystem
+                        // matched the way is_subsystem and FSO's string_lookup do, so "$special=Subsystem"
+                        // doesn't show a blank type next to a path button which considers it a subsystem
                         if let Some(i) = types.iter().position(|str| str.eq_ignore_ascii_case(type_str)) {
                             idx = i;
                         }
@@ -3583,8 +3585,9 @@ impl PofToolsGui {
                 ui.separator();
 
                 // Rebuild just this path, from whichever object claims it
-                let regen_target = path_num.and_then(|num| self.model.path_target(PathId(num as u32)));
-                let contested = path_num.is_some_and(|num| self.model.path_is_contested(PathId(num as u32)));
+                let index = self.model.path_name_index();
+                let regen_target = path_num.and_then(|num| self.model.path_target_with(&index, PathId(num as u32)));
+                let contested = path_num.is_some_and(|num| self.model.path_is_contested_with(&index, PathId(num as u32)));
                 let response = ui
                     .add_enabled(regen_target.is_some() && !contested, egui::Button::new("Regenerate This Path"))
                     .on_hover_text("Rebuilds this path's points from the object which claims it, keeping its name")
@@ -3657,12 +3660,15 @@ impl PofToolsGui {
                         // Only the path FSO would actually use is touched; any extras naming the same
                         // object are left alone.
                         if self.auto_gen_paths_regen_existing {
+                            // one index for the whole sweep - resolving each target through the plain
+                            // wrappers would rebuild it once per target
+                            let index = self.model.path_name_index();
                             for target in self.model.path_targets() {
-                                if let Some(path_id) = self.model.first_path_for(target) {
+                                if let Some(path_id) = self.model.first_path_for_with(&index, target) {
                                     // a path more than one object claims is left for the user to sort
                                     // out, rather than having one claimant silently reshape it for the
                                     // others
-                                    if self.model.path_is_contested(path_id) {
+                                    if self.model.path_is_contested_with(&index, path_id) {
                                         continue;
                                     }
                                     let path = &mut post_paths[path_id.0 as usize];
