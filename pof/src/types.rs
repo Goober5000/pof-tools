@@ -2013,6 +2013,7 @@ impl Model {
                 Warning::RadiusTooSmall(smodel_opt) => self.radius_test_failed(*smodel_opt),
                 Warning::BBoxTooSmall(smodel_opt) => self.bbox_test_failed(*smodel_opt),
                 Warning::DockingBayWithoutPath(bay_num) => self.docking_bays.get(*bay_num).map_or(false, |bay| bay.path.is_none()),
+                Warning::PathClaimedByMultipleObjects(idx) => self.path_is_contested(PathId(*idx as u32)),
                 Warning::ThrusterPropertiesInvalidVersion(bank_idx) => {
                     self.version <= Version::V21_16 && self.thruster_banks.get(*bank_idx).map_or(false, |bank| !bank.properties.is_empty())
                 }
@@ -2200,6 +2201,10 @@ impl Model {
             for (i, path) in self.paths.iter().enumerate() {
                 if path.name.len() > MAX_NAME_LEN {
                     self.warnings.insert(Warning::PathNameTooLong(i));
+                }
+
+                if self.path_is_contested(PathId(i as u32)) {
+                    self.warnings.insert(Warning::PathClaimedByMultipleObjects(i));
                 }
             }
 
@@ -3283,6 +3288,7 @@ pub enum Warning {
     TooFewTurretFirePoints(usize),
     TooManyTurretFirePoints(usize),
     DuplicatePathName(String),
+    PathClaimedByMultipleObjects(usize),
     DuplicateDetailLevel(SubmodelId),
     TooManyEyePoints,
     TooManyTextures,

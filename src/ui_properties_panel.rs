@@ -181,7 +181,10 @@ fn text_edit_single(
                 swap(&mut old_val, val);
             }
         });
-        let _ = undo_history.apply(model, UndoAction { function: func });
+        // model_action rather than applying to the undo history directly, so that warnings and
+        // errors get rechecked: anything derived from more than one object - two of them claiming
+        // one path, say - goes stale the moment one of the names behind it is edited here
+        model_action(undo_history, model, func);
     }
 
     egui::TextEdit::load_state(ui.ctx(), egui_id).unwrap().clear_undoer();
@@ -209,7 +212,7 @@ fn text_edit_multi(
                 swap(&mut old_val, val);
             }
         });
-        let _ = undo_history.apply(model, UndoAction { function: func });
+        model_action(undo_history, model, func);
     }
 
     egui::TextEdit::load_state(ui.ctx(), egui_id).unwrap().clear_undoer();
@@ -393,7 +396,7 @@ impl UiState {
             if response.changed() {
                 if let Ok(new_val) = parsable_string.parse::<T>() {
                     let func = model_func(model, new_val);
-                    let _ = undo_history.apply(model, UndoAction { function: func });
+                    model_action(undo_history, model, func);
 
                     *viewport_3d_dirty = true;
                 }
@@ -429,7 +432,7 @@ impl UiState {
                         info!("Modifying: {}", id);
                         swap(&mut new_val, val);
                     });
-                    let _ = undo_history.apply(model, UndoAction { function: func });
+                    model_action(undo_history, model, func);
 
                     *viewport_3d_dirty = true;
                 }

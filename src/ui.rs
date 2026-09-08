@@ -4,7 +4,7 @@ use glium::{
     texture::{RawImage2d, SrgbTexture2d},
     Display,
 };
-use pof::{properties_get_field, Error, Set, Submodel, SubmodelVec, TextureId, Vec3d, Version, Warning, WeaponHardpoint};
+use pof::{properties_get_field, Error, PathId, Set, Submodel, SubmodelVec, TextureId, Vec3d, Version, Warning, WeaponHardpoint};
 use std::{
     collections::HashMap,
     f32::consts::{FRAC_PI_2, PI},
@@ -120,6 +120,7 @@ impl TreeValue {
             Warning::SubmodelTranslationInvalidVersion(id) => Some(TreeValue::Submodels(SubmodelTreeValue::Submodel(*id))),
             Warning::UntexturedPolygons => Some(TreeValue::Textures(TextureTreeValue::tex(model.untextured_idx))),
             Warning::DockingBayWithoutPath(idx) => Some(TreeValue::DockingBays(DockingTreeValue::Bay(*idx))),
+            Warning::PathClaimedByMultipleObjects(idx) => Some(TreeValue::Paths(PathTreeValue::Path(*idx))),
             Warning::ThrusterPropertiesInvalidVersion(idx) => Some(TreeValue::Thrusters(ThrusterTreeValue::Bank(*idx))),
             Warning::WeaponOffsetInvalidVersion { primary, bank, point } => {
                 if *primary {
@@ -1141,6 +1142,19 @@ impl PofToolsGui {
                                     format!(
                                         "⚠ Docking bay {} cannot be used by ships without a path",
                                         self.model.docking_bays[*bay_num].get_name().unwrap_or(&(bay_num + 1).to_string())
+                                    )
+                                }
+                                Warning::PathClaimedByMultipleObjects(idx) => {
+                                    let claimants = self
+                                        .model
+                                        .path_claimants(PathId(*idx as u32))
+                                        .into_iter()
+                                        .map(|target| self.model.path_target_label(target))
+                                        .collect::<Vec<_>>();
+                                    format!(
+                                        "⚠ Path {} is claimed by {}, only one of them can use it",
+                                        self.model.paths[*idx].name,
+                                        claimants.join(" and ")
                                     )
                                 }
                                 Warning::ThrusterPropertiesInvalidVersion(idx) => {

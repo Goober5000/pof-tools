@@ -521,6 +521,49 @@ fn auto_gen_repairs_a_dangling_dock_link() {
 }
 
 #[test]
+fn two_bays_on_one_path_are_flagged_too() {
+    let mut model = base_model();
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, 20.0), ..Default::default() });
+    model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, -20.0), ..Default::default() });
+    let (generated, assignments) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    for (bay, path) in assignments {
+        model.docking_bays[bay].path = Some(path);
+    }
+    model.recheck_warnings(Set::All);
+    assert!(model.warnings.iter().all(|warning| !matches!(warning, Warning::PathClaimedByMultipleObjects(_))));
+
+    // the user repoints bay 1 at bay 0's path
+    model.docking_bays[1].path = Some(PathId(1));
+    model.recheck_warnings(Set::All);
+    assert!(model.warnings.contains(&Warning::PathClaimedByMultipleObjects(1)));
+}
+
+#[test]
+fn a_contested_path_is_flagged() {
+    let mut model = turret_model();
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    assert_eq!(model.paths[0].parent, "turret01");
+
+    // the user points bay 0 at the turret's path
+    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
+
+    model.recheck_warnings(Set::All);
+    assert!(model.warnings.contains(&Warning::PathClaimedByMultipleObjects(0)));
+    assert!(!model.warnings.contains(&Warning::PathClaimedByMultipleObjects(1)), "the untouched path is fine");
+
+    // pointing it at a path of its own clears the warning again
+    model.paths.push(Path { name: "$path09".into(), parent: "$dock01-01".into(), points: vec![] });
+    let own_path = PathId(model.paths.len() as u32 - 1);
+    model.docking_bays[0].path = Some(own_path);
+
+    assert!(model.path_claimants(own_path) == vec![PathTarget::DockingBay(0)], "a $dockNN-01 parent names no object");
+    model.recheck_warnings(Set::All);
+    assert!(model.warnings.iter().all(|warning| !matches!(warning, Warning::PathClaimedByMultipleObjects(_))));
+}
+
+#[test]
 fn an_empty_parent_names_nothing() {
     // every path in a POF older than version 20.02 has an empty parent, since the field isn't
     // written before then, and FSO doesn't resolve those either
