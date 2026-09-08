@@ -536,6 +536,45 @@ fn auto_gen_repairs_a_dangling_dock_link() {
 }
 
 #[test]
+fn a_dock_link_past_the_end_reads_as_no_link() {
+    // dock_path is the cheap way to ask what first_path_for and the claim model already say, so the
+    // panel can bound its combo box without a second opinion about what counts as a link
+    let mut model = base_model();
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
+    model.docking_bays.push(Dock { path: Some(PathId(7)), ..Default::default() });
+    model.docking_bays.push(Dock { path: None, ..Default::default() });
+
+    for bay in 0..model.docking_bays.len() {
+        assert_eq!(model.dock_path(bay), model.first_path_for(PathTarget::DockingBay(bay)), "bay {}", bay);
+    }
+    assert_eq!(model.dock_path(0), Some(PathId(0)));
+    assert_eq!(model.dock_path(1), None, "past the end is no link");
+    assert_eq!(model.dock_path(2), None);
+    assert_eq!(model.dock_path(9), None, "and neither is a bay which isn't there");
+}
+
+#[test]
+fn appending_a_path_doesnt_hand_it_to_a_bay_whose_link_dangles() {
+    // dock_paths is what the panel snapshots before generating a path for one object. Take the raw
+    // links instead and a bay dangling at exactly the new path's index would silently adopt it
+    let mut model = base_model();
+    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
+    assert_eq!(model.dock_paths(), vec![None], "nothing to point at yet");
+
+    let snapshot = model.dock_paths();
+    model.paths.push(model.gen_path_for(PathTarget::Submodel(SubmodelId(1)), model.path_name_gen().next_name()));
+    for (bay, path) in model.docking_bays.iter_mut().zip(snapshot) {
+        bay.path = path;
+    }
+
+    assert_eq!(model.path_claimants(PathId(0)), vec![PathTarget::Submodel(SubmodelId(1))], "engine01's path, and only its");
+    assert!(!model.path_is_contested(PathId(0)));
+    assert_eq!(model.dock_path(0), None, "the bay still has no path of its own");
+}
+
+#[test]
 fn two_bays_on_one_path_are_flagged_too() {
     let mut model = base_model();
     model.docking_bays.push(Dock { position: Vec3d::new(0.0, 0.0, 20.0), ..Default::default() });

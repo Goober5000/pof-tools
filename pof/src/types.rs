@@ -2067,7 +2067,7 @@ impl Model {
             let failed_check = match &warning {
                 Warning::RadiusTooSmall(smodel_opt) => self.radius_test_failed(*smodel_opt),
                 Warning::BBoxTooSmall(smodel_opt) => self.bbox_test_failed(*smodel_opt),
-                Warning::DockingBayWithoutPath(bay_num) => self.docking_bays.get(*bay_num).map_or(false, |bay| bay.path.is_none()),
+                Warning::DockingBayWithoutPath(bay_num) => *bay_num < self.docking_bays.len() && self.dock_path(*bay_num).is_none(),
                 Warning::PathClaimedByMultipleObjects(idx) => self.path_is_contested(PathId(*idx as u32)),
                 Warning::ThrusterPropertiesInvalidVersion(bank_idx) => {
                     self.version <= Version::V21_16 && self.thruster_banks.get(*bank_idx).map_or(false, |bank| !bank.properties.is_empty())
@@ -2181,7 +2181,9 @@ impl Model {
             }
 
             for (i, dock) in self.docking_bays.iter().enumerate() {
-                if dock.path.is_none() {
+                // dock_path, not the raw link: one pointing past the end of the path list is no path
+                // as far as everything else here is concerned, and the bay wants telling about it
+                if self.dock_path(i).is_none() {
                     self.warnings.insert(Warning::DockingBayWithoutPath(i));
                 }
 
@@ -2772,6 +2774,21 @@ impl Model {
             .map(|idx| PathId(idx as u32))
             .filter(|&id| self.path_claimants_with(&index, id).contains(&target))
             .collect()
+    }
+
+    /// The path a docking bay links to, if that link still points at one. A link past the end of the
+    /// path list counts as no link at all, which is the view `first_path_for` and the claim model
+    /// take of it too - this is just the cheap way to ask, for callers which have a bay in hand.
+    pub fn dock_path(&self, bay_idx: usize) -> Option<PathId> {
+        self.docking_bays.get(bay_idx)?.path.filter(|path| (path.0 as usize) < self.paths.len())
+    }
+
+    /// Every bay's path link in bay order, each read the way `dock_path` reads one.
+    ///
+    /// This is the snapshot to take before appending paths: carrying the raw links across instead
+    /// would let a dangling one come back to life the moment a new path lands on its index.
+    pub fn dock_paths(&self) -> Vec<Option<PathId>> {
+        (0..self.docking_bays.len()).map(|bay_idx| self.dock_path(bay_idx)).collect()
     }
 
     /// The one path FSO would actually use for `target`.

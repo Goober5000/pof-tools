@@ -90,7 +90,9 @@ fn regenerate_path(undo_history: &mut undo::History<UndoAction>, model: &mut Mod
 /// Generates the missing path for `target`, appending it and, for a docking bay, linking the bay to it.
 fn generate_path_for(undo_history: &mut undo::History<UndoAction>, model: &mut Model, target: PathTarget) {
     let mut new_paths = model.paths.clone();
-    let mut new_dock_refs: Vec<Option<PathId>> = model.docking_bays.iter().map(|bay| bay.path).collect();
+    // dock_paths, not the raw links: a bay whose link dangles at exactly the index this path is
+    // about to take would otherwise find itself owning it
+    let mut new_dock_refs = model.dock_paths();
 
     let path_id = PathId(new_paths.len() as u32);
     new_paths.push(model.gen_path_for(target, model.path_name_gen().next_name()));
@@ -788,7 +790,9 @@ impl UiState {
                         position_string: format!("{}", model.docking_bays[bay].position),
                         fvec_string: format!("{}", model.docking_bays[bay].fvec.0),
                         uvec_ang: model.docking_bays[bay].get_uvec_angle().to_degrees() % 360.0,
-                        path_num: model.docking_bays[bay].path.unwrap_or(PathId(model.paths.len() as u32)).0 as usize,
+                        // dock_path rather than the raw link: a link past the end of the path list
+                        // shows as "no path" instead of indexing the combo box out of range
+                        path_num: model.dock_path(bay).unwrap_or(PathId(model.paths.len() as u32)).0 as usize,
                     }
                 }
                 _ => self.properties_panel = PropertiesPanel::default_docking_bay(),
@@ -2826,9 +2830,11 @@ impl PofToolsGui {
                 //  no valid bay selected -> a single empty string
                 //  valid bay, without a path -> list of paths, followed by a single empty string
                 //  valid bay, with a path -> list of paths
+                // a link pointing past the end of the list counts as being without a path, so that
+                // the empty entry is there for path_num to land on
                 let paths = if let Some(bay) = bay_num {
                     let mut out: Vec<String> = self.model.paths.iter().map(|path| path.name.clone()).collect();
-                    if self.model.docking_bays[bay].path.is_none() {
+                    if self.model.dock_path(bay).is_none() {
                         out.push(String::new());
                     }
                     out
@@ -3665,7 +3671,7 @@ impl PofToolsGui {
                         let mut changed = !generated.is_empty();
                         let mut post_paths = self.model.paths.clone();
                         post_paths.extend(generated);
-                        let mut post_dock_refs: Vec<Option<PathId>> = self.model.docking_bays.iter().map(|d| d.path).collect();
+                        let mut post_dock_refs = self.model.dock_paths();
                         for &(bay_idx, path_id) in &dock_assignments {
                             post_dock_refs[bay_idx] = Some(path_id);
                         }
