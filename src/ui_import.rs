@@ -1093,6 +1093,25 @@ fn selectable_label(ui: &mut Ui, selection: SelectionType, label: impl Into<Widg
 }
 
 impl PofToolsGui {
+    /// Resolves the submodel a freshly-imported eye point should attach to: the imported submodel's
+    /// new id if it came along, otherwise an existing same-named submodel here, otherwise nothing -
+    /// never a stale id from the model being imported from. Used by both import modes so they agree.
+    fn resolve_imported_eye_submodel(
+        &self,
+        import_model: &pof::Model,
+        model_id_map: &HashMap<SubmodelId, SubmodelId>,
+        attached: Option<SubmodelId>,
+    ) -> Option<SubmodelId> {
+        let attached = attached?;
+        if let Some(new_id) = model_id_map.get(&attached) {
+            // the parent submodel was imported alongside the eye point - follow it to its fresh id
+            return Some(*new_id);
+        }
+        // it wasn't imported, but a submodel of the same name may already exist here
+        let name = &import_model.submodels[attached].name;
+        self.model.submodels.iter().find(|smodel| smodel.name == *name).map(|smodel| smodel.id)
+    }
+
     pub fn merge_import_model(&mut self) {
         // this does a lot of much quicker std::mem:takes instead of clones
         // this will mangle the import_model so we must take it by value
@@ -1247,21 +1266,18 @@ impl PofToolsGui {
                 TreeValue::Glows(GlowTreeValue::Bank(idx)) => {
                     let mut g_bank = std::mem::take(&mut import_model.glow_banks[idx]);
 
-                    if !model_id_map.contains_key(&g_bank.model_parent) {
-                        // reset it to detail0
-                        // ... if theres no detail0, just the first submodel
-                        // ... if theres no models, skip it i guess
-                        if let Some(id) = self
-                            .model
-                            .header
-                            .detail_levels
-                            .first()
-                            .or_else(|| self.model.submodels.first().map(|smodel| &smodel.id))
-                        {
-                            g_bank.model_parent = *id;
-                        } else {
-                            continue;
-                        }
+                    if let Some(parent) = self.resolve_imported_eye_submodel(&import_model, &model_id_map, Some(g_bank.model_parent)) {
+                        // imported alongside it, or a same-named submodel already here - follow it,
+                        // the same reconnection eye points and turrets make
+                        g_bank.model_parent = parent;
+                    } else if self.model.submodels.is_empty() {
+                        // importing into a still-empty model, so there is nothing to attach it to -
+                        // a bank only ever sits on a submodel, so drop it rather than invent one
+                        continue;
+                    } else {
+                        // parent wasn't imported and nothing here matches by name; fall back to
+                        // detail0 (or the first submodel), the same repair the load-time sanitizer applies
+                        g_bank.model_parent = self.model.glow_bank_parent_fallback();
                     }
 
                     self.model.glow_banks.push(g_bank);
@@ -1334,20 +1350,21 @@ impl PofToolsGui {
                 TreeValue::EyePoints(EyeTreeValue::EyePoint(idx)) => {
                     let mut point = std::mem::take(&mut import_model.eye_points[idx]);
 
+                    // settle the attachment to a destination submodel up front - safe here, where
+                    // the source names resolve_imported_eye_submodel needs are still intact. Matching
+                    // then compares that resolved id and never indexes the submodel list (which isn't
+                    // grown until the loop further below), so a not-yet-installed id can't panic.
+                    point.attached_submodel = self.resolve_imported_eye_submodel(&import_model, &model_id_map, point.attached_submodel);
+
                     match self.import_window.import_type {
-                        ImportType::Add => {
-                            self.model.eye_points.push(point);
-                        }
+                        ImportType::Add => self.model.eye_points.push(point),
                         ImportType::MatchAndReplace => {
-                            let attached_model = point.attached_submodel.map(|id| &import_model.submodels[id].name);
-                            // find and replace
-                            if let Some(replaced_point) = self.model.pof_model.eye_points.iter_mut().find(|replaced_point| {
-                                replaced_point.attached_submodel.map(|id| &self.model.pof_model.submodels[id].name) == attached_model
-                            }) {
-                                point.attached_submodel = replaced_point.attached_submodel;
+                            // replace the existing eye on the same submodel - an unattached one
+                            // (None) matching another unattached one - else add it
+                            let target = point.attached_submodel;
+                            if let Some(replaced_point) = self.model.eye_points.iter_mut().find(|p| p.attached_submodel == target) {
                                 *replaced_point = point;
                             } else {
-                                // fall back, just add it
                                 self.model.eye_points.push(point);
                             }
                         }
@@ -1488,5 +1505,11 @@ impl PofToolsGui {
 
         self.model.recalc_semantic_name_links();
         self.model.recalc_all_children_ids();
+
+        // the remaps above aim each imported index at where it landed; this is the safety net,
+        // establishing the same no-dangling-index invariant the loaders do so a stray one can't
+        // reach the UI and panic when it's drawn or selected. As at load, it runs after the recalcs
+        // so it sees the model in its final shape (recalc_all_children_ids in particular).
+        self.model.sanitize_index_references();
     }
 }
