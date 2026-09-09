@@ -67,6 +67,49 @@ fn updating_replaces_only_the_value() {
 }
 
 #[test]
+fn giving_a_valueless_field_a_value_writes_a_separator() {
+    // "$special" on its own has no separator to put the value after, and writing one without it
+    // produced "$specialsubsystem" - which FSO doesn't recognize as $special at all, and which
+    // properties_get_field then reads straight back as "subsystem", so nothing looked wrong here
+    let mut props = "$special\n$name=X".to_string();
+    properties_update_field(&mut props, "$special", "subsystem");
+    assert_eq!(props, "$special=subsystem\n$name=X");
+    assert_eq!(properties_get_field(&props, "$name"), Some("X"), "and the rest of the line is untouched");
+
+    let mut props = "$special".to_string();
+    properties_update_field(&mut props, "$special", "subsystem");
+    assert_eq!(props, "$special=subsystem");
+
+    let mut props = "$name=bay\n$special".to_string();
+    properties_update_field(&mut props, "$special", "subsystem");
+    assert_eq!(props, "$name=bay\n$special=subsystem");
+
+    // a flag being turned into a field is the same shape
+    let mut props = "$no_rotate\n$name=bay".to_string();
+    properties_update_field(&mut props, "$no_rotate", "yes");
+    assert_eq!(props, "$no_rotate=yes\n$name=bay");
+
+    // ...while a field which already has a separator keeps the one it was written with
+    let mut props = "$special=\n$name=X".to_string();
+    properties_update_field(&mut props, "$special", "subsystem");
+    assert_eq!(props, "$special=subsystem\n$name=X");
+
+    let mut props = "$special:\t".to_string();
+    properties_update_field(&mut props, "$special", "subsystem");
+    assert_eq!(props, "$special:\tsubsystem");
+}
+
+#[test]
+fn a_valueless_field_given_a_value_becomes_a_subsystem() {
+    // the user reachable route in: the Special Point type combo box writes $special through
+    // properties_update_field, and is_subsystem reads it back
+    let mut spcl = SpecialPoint { properties: "$special".to_string(), ..Default::default() };
+    assert!(!spcl.is_subsystem());
+    properties_update_field(&mut spcl.properties, "$special", "subsystem");
+    assert!(spcl.is_subsystem(), "wrote {:?}", spcl.properties);
+}
+
+#[test]
 fn updating_a_missing_field_appends_it() {
     let mut props = "$other=1".to_string();
     properties_update_field(&mut props, "$name", "bay");

@@ -3125,7 +3125,9 @@ pub fn post_parse_fill_untextured_slot(sub_objects: &mut Vec<Submodel>, textures
 }
 
 pub fn properties_delete_field(properties: &mut String, field: &str) {
-    if let (Some(field_idx), Some((_, value_end))) = (properties.find(field), properties_find_field(properties, field)) {
+    if let Some((after_field, _, value_end)) = properties_find_field(properties, field) {
+        let field_idx = after_field - field.len();
+
         // take the line break after the value along with it, instead of leaving a blank line behind
         let next_line = value_end + byte_offset_of_first(&properties[value_end..], |c| !c.is_ascii_control());
 
@@ -3147,8 +3149,10 @@ fn is_field_separator(c: char) -> bool {
     c == '=' || c == ':' || (c.is_whitespace() && c != '\n')
 }
 
-/// The byte range of the value belonging to `field`, if the field is present at all.
-fn properties_find_field(properties: &str, field: &str) -> Option<(usize, usize)> {
+/// Where the field name ends and its value begins and ends, as byte offsets, if the field is
+/// present at all. Readers want the value alone (`value_start..value_end`); the writer also needs
+/// to know whether a separator is there (`value_start == after_field` when there is none).
+fn properties_find_field(properties: &str, field: &str) -> Option<(usize, usize, usize)> {
     let after_field = properties.find(field)? + field.len();
 
     // skip whatever separates the field name from its value...
@@ -3159,26 +3163,29 @@ fn properties_find_field(properties: &str, field: &str) -> Option<(usize, usize)
     // field name ended the value before it had begun.
     let value_end = value_start + byte_offset_of_first(&properties[value_start..], |c| c.is_ascii_control());
 
-    Some((value_start, value_end))
+    Some((after_field, value_start, value_end))
 }
 
 pub fn properties_update_field(properties: &mut String, field: &str, val: &str) {
     if val == "" {
         properties_delete_field(properties, field);
+    } else if properties.is_empty() {
+        *properties = format!("{}={}", field, val);
+    } else if let Some((after_field, value_start, value_end)) = properties_find_field(properties, field) {
+        // a field with nothing after its name - "$special" on its own, or a flag being given a
+        // value - has no separator to write the value after, and one has to go in. Without it the
+        // value runs straight into the name, turning "$special" into "$specialsubsystem": a field
+        // FSO has never heard of, which this code then reads back as "$special" and calls correct.
+        let separator = if value_start == after_field { "=" } else { "" };
+        *properties = format!("{}{}{}{}", &properties[..value_start], separator, val, &properties[value_end..]);
     } else {
-        if properties.is_empty() {
-            *properties = format!("{}={}", field, val);
-        } else if let Some((start_idx, end_idx)) = properties_find_field(properties, field) {
-            *properties = format!("{}{}{}", &properties[..start_idx], val, &properties[end_idx..]);
-        } else {
-            *properties = format!("{}\n{}={}", properties, field, val);
-        }
+        *properties = format!("{}\n{}={}", properties, field, val);
     }
 }
 
 pub fn properties_get_field<'a>(properties: &'a str, field: &str) -> Option<&'a str> {
-    if let Some((start_idx, end_idx)) = properties_find_field(properties, field) {
-        Some(&properties[start_idx..end_idx])
+    if let Some((_, value_start, value_end)) = properties_find_field(properties, field) {
+        Some(&properties[value_start..value_end])
     } else {
         None
     }
