@@ -1,5 +1,5 @@
 use egui::{collapsing_header::CollapsingState, Button, Color32, Id, Response, RichText, TextEdit, TextStyle, Ui, WidgetText};
-use pof::{properties_delete_field, Submodel, SubmodelId, TextureId};
+use pof::{properties_delete_field, PathId, Submodel, SubmodelId, TextureId};
 
 use crate::{
     start_loading_import_model,
@@ -1099,6 +1099,13 @@ impl PofToolsGui {
         let selection = std::mem::take(&mut self.import_window.import_selection);
         let mut import_model = std::mem::take(&mut self.import_window.model).unwrap();
 
+        // where each imported path ended up here, keyed by its index in the model being imported
+        // from, so a docking bay's link can be pointed at it once the whole selection has landed
+        let mut path_id_map: HashMap<usize, PathId> = HashMap::new();
+        // the bays this import placed, by their index in the receiving model. Each still carries the
+        // path index it had in the model being imported from, resolved once every path has landed.
+        let mut imported_bays: BTreeSet<usize> = BTreeSet::new();
+
         // make the model id map to translate old model ids to new model ids
         let mut model_id_map = HashMap::new();
         let mut num_submodels = self.model.submodels.len();
@@ -1146,6 +1153,10 @@ impl PofToolsGui {
                 TreeValue::DockingBays(DockingTreeValue::Bay(idx)) => {
                     // requires getting submodels by name -> still have to be intact
                     let mut dock = std::mem::take(&mut import_model.docking_bays[idx]);
+
+                    // dock.path still indexes the model being imported from; it's remapped to
+                    // wherever that path landed here once the whole selection is in, below.
+
                     if let Some(parent_name) = dock.get_parent_smodel() {
                         if import_model
                             .get_model_id_by_name(parent_name)
@@ -1156,26 +1167,37 @@ impl PofToolsGui {
                         }
                     }
 
-                    match self.import_window.import_type {
+                    // which bay in this model the imported one became, if it became one at all
+                    let new_bay = match self.import_window.import_type {
                         ImportType::Add => {
                             self.model.docking_bays.push(dock);
+                            Some(self.model.docking_bays.len() - 1)
                         }
                         ImportType::MatchAndReplace => {
                             // find and replace
                             if let Some(name) = dock.get_name() {
-                                if let Some(replaced_dock) = self
+                                if let Some(replaced_idx) = self
                                     .model
                                     .docking_bays
-                                    .iter_mut()
-                                    .find(|replaced_dock| replaced_dock.get_name() == Some(name))
+                                    .iter()
+                                    .position(|replaced_dock| replaced_dock.get_name() == Some(name))
                                 {
-                                    *replaced_dock = dock;
+                                    self.model.docking_bays[replaced_idx] = dock;
+                                    Some(replaced_idx)
                                 } else {
                                     // fall back, just add it
                                     self.model.docking_bays.push(dock);
+                                    Some(self.model.docking_bays.len() - 1)
                                 }
+                            } else {
+                                // a bay with no name has nothing to match against, and is dropped
+                                None
                             }
                         }
+                    };
+
+                    if let Some(bay_idx) = new_bay {
+                        imported_bays.insert(bay_idx);
                     }
                 }
                 TreeValue::DockingBays(_) => unreachable!(),
@@ -1432,23 +1454,36 @@ impl PofToolsGui {
                 TreeValue::Paths(PathTreeValue::Path(idx)) => {
                     let path = std::mem::take(&mut import_model.paths[idx]);
 
-                    match self.import_window.import_type {
+                    // where it landed, so a docking bay which linked to it can be pointed there
+                    let new_path = match self.import_window.import_type {
                         ImportType::Add => {
                             self.model.paths.push(path);
+                            self.model.paths.len() - 1
                         }
                         ImportType::MatchAndReplace => {
-                            if let Some(replaced_path) = self.model.paths.iter_mut().find(|replaced_path| replaced_path.name == path.name) {
-                                *replaced_path = path;
+                            if let Some(replaced_idx) = self.model.paths.iter().position(|replaced_path| replaced_path.name == path.name) {
+                                self.model.paths[replaced_idx] = path;
+                                replaced_idx
                             } else {
                                 // fall back, just add it
                                 self.model.paths.push(path);
+                                self.model.paths.len() - 1
                             }
                         }
-                    }
+                    };
+                    path_id_map.insert(idx, PathId(new_path as u32));
                 }
                 TreeValue::Paths(_) => unreachable!(),
                 _ => (),
             }
+        }
+
+        // now every selected path has landed, so each imported bay can follow the path it carried
+        // over to wherever it ended up - or lose the link if that path didn't come along, rather
+        // than keep an index which names a stranger's path here
+        for bay_idx in imported_bays {
+            let old_path = self.model.docking_bays[bay_idx].path;
+            self.model.docking_bays[bay_idx].path = old_path.and_then(|p| path_id_map.get(&(p.0 as usize)).copied());
         }
 
         self.model.recalc_semantic_name_links();
