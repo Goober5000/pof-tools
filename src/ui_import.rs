@@ -1093,22 +1093,23 @@ fn selectable_label(ui: &mut Ui, selection: SelectionType, label: impl Into<Widg
 }
 
 impl PofToolsGui {
-    /// Resolves the submodel a freshly-imported eye point should attach to: the imported submodel's
-    /// new id if it came along, otherwise an existing same-named submodel here, otherwise nothing -
-    /// never a stale id from the model being imported from. Used by both import modes so they agree.
-    fn resolve_imported_eye_submodel(
+    /// Resolves where a submodel referenced by freshly-imported data (an eye point's attachment, a
+    /// turret's base) should point here: the imported submodel's new id if it came along, otherwise
+    /// an existing same-named submodel here, otherwise nothing - never a stale id from the model
+    /// being imported from. Shared by the import paths so they agree.
+    fn resolve_imported_submodel(
         &self,
         import_model: &pof::Model,
         model_id_map: &HashMap<SubmodelId, SubmodelId>,
-        attached: Option<SubmodelId>,
+        submodel: Option<SubmodelId>,
     ) -> Option<SubmodelId> {
-        let attached = attached?;
-        if let Some(new_id) = model_id_map.get(&attached) {
-            // the parent submodel was imported alongside the eye point - follow it to its fresh id
+        let submodel = submodel?;
+        if let Some(new_id) = model_id_map.get(&submodel) {
+            // it was imported alongside the referencing data - follow it to its fresh id
             return Some(*new_id);
         }
         // it wasn't imported, but a submodel of the same name may already exist here
-        let name = &import_model.submodels[attached].name;
+        let name = &import_model.submodels.get(submodel.0 as usize)?.name;
         self.model.submodels.iter().find(|smodel| smodel.name == *name).map(|smodel| smodel.id)
     }
 
@@ -1266,7 +1267,7 @@ impl PofToolsGui {
                 TreeValue::Glows(GlowTreeValue::Bank(idx)) => {
                     let mut g_bank = std::mem::take(&mut import_model.glow_banks[idx]);
 
-                    if let Some(parent) = self.resolve_imported_eye_submodel(&import_model, &model_id_map, Some(g_bank.model_parent)) {
+                    if let Some(parent) = self.resolve_imported_submodel(&import_model, &model_id_map, Some(g_bank.model_parent)) {
                         // imported alongside it, or a same-named submodel already here - follow it,
                         // the same reconnection eye points and turrets make
                         g_bank.model_parent = parent;
@@ -1322,10 +1323,16 @@ impl PofToolsGui {
                             self.model.turrets.push(turret);
                         }
                         ImportType::MatchAndReplace => {
+                            // settle the base to a destination submodel up front - safe here, where
+                            // the source names resolve_imported_submodel needs are still intact. The
+                            // match then compares that resolved id and never indexes the submodel
+                            // list (not grown until the loop below), so a turret pushed earlier in
+                            // this import, carrying a not-yet-installed base id, can't panic it.
+                            let resolved_base = self.resolve_imported_submodel(&import_model, &model_id_map, Some(turret.base_model));
                             // find and replace
-                            if let Some(replaced_turret) = self.model.pof_model.turrets.iter_mut().find(|replaced_turret| {
-                                self.model.pof_model.submodels[replaced_turret.base_model].name == import_model.submodels[turret.base_model].name
-                            }) {
+                            if let Some(replaced_turret) = resolved_base
+                                .and_then(|base| self.model.turrets.iter_mut().find(|replaced_turret| replaced_turret.base_model == base))
+                            {
                                 turret.base_model = replaced_turret.base_model;
                                 turret.gun_model = if model_id_map.contains_key(&turret.gun_model) {
                                     model_id_map[&turret.gun_model] // prefer an imported gun model, instead of the replace turret's
@@ -1351,10 +1358,10 @@ impl PofToolsGui {
                     let mut point = std::mem::take(&mut import_model.eye_points[idx]);
 
                     // settle the attachment to a destination submodel up front - safe here, where
-                    // the source names resolve_imported_eye_submodel needs are still intact. Matching
+                    // the source names resolve_imported_submodel needs are still intact. Matching
                     // then compares that resolved id and never indexes the submodel list (which isn't
                     // grown until the loop further below), so a not-yet-installed id can't panic.
-                    point.attached_submodel = self.resolve_imported_eye_submodel(&import_model, &model_id_map, point.attached_submodel);
+                    point.attached_submodel = self.resolve_imported_submodel(&import_model, &model_id_map, point.attached_submodel);
 
                     match self.import_window.import_type {
                         ImportType::Add => self.model.eye_points.push(point),
