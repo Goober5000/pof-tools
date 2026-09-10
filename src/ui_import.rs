@@ -1093,26 +1093,6 @@ fn selectable_label(ui: &mut Ui, selection: SelectionType, label: impl Into<Widg
 }
 
 impl PofToolsGui {
-    /// Resolves where a submodel referenced by freshly-imported data (an eye point's attachment, a
-    /// turret's base) should point here: the imported submodel's new id if it came along, otherwise
-    /// an existing same-named submodel here, otherwise nothing - never a stale id from the model
-    /// being imported from. Shared by the import paths so they agree.
-    fn resolve_imported_submodel(
-        &self,
-        import_model: &pof::Model,
-        model_id_map: &HashMap<SubmodelId, SubmodelId>,
-        submodel: Option<SubmodelId>,
-    ) -> Option<SubmodelId> {
-        let submodel = submodel?;
-        if let Some(new_id) = model_id_map.get(&submodel) {
-            // it was imported alongside the referencing data - follow it to its fresh id
-            return Some(*new_id);
-        }
-        // it wasn't imported, but a submodel of the same name may already exist here
-        let name = &import_model.submodels.get(submodel.0 as usize)?.name;
-        self.model.submodels.iter().find(|smodel| smodel.name == *name).map(|smodel| smodel.id)
-    }
-
     pub fn merge_import_model(&mut self) {
         // this does a lot of much quicker std::mem:takes instead of clones
         // this will mangle the import_model so we must take it by value
@@ -1125,6 +1105,14 @@ impl PofToolsGui {
         // the bays this import placed, by their index in the receiving model. Each still carries the
         // path index it had in the model being imported from, resolved once every path has landed.
         let mut imported_bays: BTreeSet<usize> = BTreeSet::new();
+
+        // turrets, eye points and glow banks all reference submodels by index. They're collected
+        // here and settled in a post-operation once every submodel has been installed below, so a
+        // name match sees the whole destination and never indexes a submodel list that hasn't grown
+        // yet - which is where a match against an item added earlier in the same import would panic.
+        let mut imported_turrets = Vec::new();
+        let mut imported_eyes = Vec::new();
+        let mut imported_glows = Vec::new();
 
         // make the model id map to translate old model ids to new model ids
         let mut model_id_map = HashMap::new();
@@ -1265,118 +1253,17 @@ impl PofToolsGui {
                 }
                 TreeValue::Thrusters(_) => unreachable!(),
                 TreeValue::Glows(GlowTreeValue::Bank(idx)) => {
-                    let mut g_bank = std::mem::take(&mut import_model.glow_banks[idx]);
-
-                    if let Some(parent) = self.resolve_imported_submodel(&import_model, &model_id_map, Some(g_bank.model_parent)) {
-                        // imported alongside it, or a same-named submodel already here - follow it,
-                        // the same reconnection eye points and turrets make
-                        g_bank.model_parent = parent;
-                    } else if self.model.submodels.is_empty() {
-                        // importing into a still-empty model, so there is nothing to attach it to -
-                        // a bank only ever sits on a submodel, so drop it rather than invent one
-                        continue;
-                    } else {
-                        // parent wasn't imported and nothing here matches by name; fall back to
-                        // detail0 (or the first submodel), the same repair the load-time sanitizer applies
-                        g_bank.model_parent = self.model.glow_bank_parent_fallback();
-                    }
-
-                    self.model.glow_banks.push(g_bank);
+                    imported_glows.push(std::mem::take(&mut import_model.glow_banks[idx]));
                 }
                 TreeValue::Glows(_) => unreachable!(),
                 TreeValue::Turrets(TurretTreeValue::Turret(idx)) => {
-                    let mut turret = std::mem::take(&mut import_model.turrets[idx]);
-
-                    match self.import_window.import_type {
-                        ImportType::Add => {
-                            if selection.contains(&TreeValue::Submodels(SubmodelTreeValue::Submodel(turret.base_model)))
-                                && selection.contains(&TreeValue::Submodels(SubmodelTreeValue::Submodel(turret.gun_model)))
-                            {
-                                // parent models were imported too, cool
-                                turret.base_model = model_id_map[&turret.base_model];
-                                turret.gun_model = model_id_map[&turret.gun_model];
-                            } else {
-                                // parent models were not imported, see if we can find parents...
-                                let mut found_match = false;
-                                for smodel in &self.model.submodels {
-                                    let singlepart_valid =
-                                        smodel.name == import_model.submodels[turret.gun_model].name && turret.gun_model == turret.base_model;
-                                    let multipart_valid = smodel.name == import_model.submodels[turret.gun_model].name
-                                        && smodel.parent().map(|id| &self.model.submodels[id].name)
-                                            == Some(&import_model.submodels[turret.base_model].name);
-
-                                    if singlepart_valid {
-                                        found_match = true;
-                                        turret.gun_model = smodel.id;
-                                        turret.base_model = smodel.id;
-                                    } else if multipart_valid {
-                                        found_match = true;
-                                        turret.gun_model = smodel.id;
-                                        turret.base_model = smodel.parent().unwrap();
-                                    }
-                                }
-
-                                if !found_match {
-                                    continue;
-                                }
-                            }
-                            self.model.turrets.push(turret);
-                        }
-                        ImportType::MatchAndReplace => {
-                            // settle the base to a destination submodel up front - safe here, where
-                            // the source names resolve_imported_submodel needs are still intact. The
-                            // match then compares that resolved id and never indexes the submodel
-                            // list (not grown until the loop below), so a turret pushed earlier in
-                            // this import, carrying a not-yet-installed base id, can't panic it.
-                            let resolved_base = self.resolve_imported_submodel(&import_model, &model_id_map, Some(turret.base_model));
-                            // find and replace
-                            if let Some(replaced_turret) = resolved_base
-                                .and_then(|base| self.model.turrets.iter_mut().find(|replaced_turret| replaced_turret.base_model == base))
-                            {
-                                turret.base_model = replaced_turret.base_model;
-                                turret.gun_model = if model_id_map.contains_key(&turret.gun_model) {
-                                    model_id_map[&turret.gun_model] // prefer an imported gun model, instead of the replace turret's
-                                } else {
-                                    replaced_turret.gun_model
-                                };
-                                *replaced_turret = turret;
-                            } else if selection.contains(&TreeValue::Submodels(SubmodelTreeValue::Submodel(turret.base_model)))
-                                && selection.contains(&TreeValue::Submodels(SubmodelTreeValue::Submodel(turret.gun_model)))
-                            {
-                                // fall back, try to add it
-                                // parent models were imported too, cool
-                                turret.base_model = model_id_map[&turret.base_model];
-                                turret.gun_model = model_id_map[&turret.gun_model];
-                                self.model.turrets.push(turret);
-                            }
-                            // else just lose it
-                        }
-                    }
+                    imported_turrets.push(std::mem::take(&mut import_model.turrets[idx]));
                 }
                 TreeValue::Turrets(_) => unreachable!(),
                 TreeValue::EyePoints(EyeTreeValue::EyePoint(idx)) => {
-                    let mut point = std::mem::take(&mut import_model.eye_points[idx]);
-
-                    // settle the attachment to a destination submodel up front - safe here, where
-                    // the source names resolve_imported_submodel needs are still intact. Matching
-                    // then compares that resolved id and never indexes the submodel list (which isn't
-                    // grown until the loop further below), so a not-yet-installed id can't panic.
-                    point.attached_submodel = self.resolve_imported_submodel(&import_model, &model_id_map, point.attached_submodel);
-
-                    match self.import_window.import_type {
-                        ImportType::Add => self.model.eye_points.push(point),
-                        ImportType::MatchAndReplace => {
-                            // replace the existing eye on the same submodel - an unattached one
-                            // (None) matching another unattached one - else add it
-                            let target = point.attached_submodel;
-                            if let Some(replaced_point) = self.model.eye_points.iter_mut().find(|p| p.attached_submodel == target) {
-                                *replaced_point = point;
-                            } else {
-                                self.model.eye_points.push(point);
-                            }
-                        }
-                    }
+                    imported_eyes.push(std::mem::take(&mut import_model.eye_points[idx]));
                 }
+                TreeValue::EyePoints(_) => unreachable!(),
                 TreeValue::Shield => {
                     let shield = std::mem::take(&mut import_model.shield_data);
 
@@ -1400,6 +1287,10 @@ impl PofToolsGui {
                 _ => (),
             }
         }
+
+        // the imported submodels' names, captured before the install loop below takes them, so the
+        // post-operation can still resolve a turret/eye/glow's source submodel to where it landed
+        let import_submodel_names: Vec<String> = import_model.submodels.iter().map(|smodel| smodel.name.clone()).collect();
 
         let old_smodel_len = self.model.submodels.len();
         for tree_val in &selection {
@@ -1500,6 +1391,84 @@ impl PofToolsGui {
                 TreeValue::Paths(_) => unreachable!(),
                 _ => (),
             }
+        }
+
+        // now every submodel is installed, so the collected turrets, eye points and glow banks can
+        // be settled against the finished destination. Each resolves by the name of the submodel it
+        // named in the source, so imported and pre-existing submodels are treated the same, and no
+        // match indexes a submodel list that isn't there yet.
+
+        // turrets: find the destination base and gun submodels by name (single- or multi-part)
+        for mut turret in imported_turrets {
+            let gun_name = import_submodel_names.get(turret.gun_model.0 as usize);
+            let base_name = import_submodel_names.get(turret.base_model.0 as usize);
+            let mut resolved = None;
+            for smodel in &self.model.submodels {
+                let singlepart_valid = Some(&smodel.name) == gun_name && turret.gun_model == turret.base_model;
+                let multipart_valid =
+                    Some(&smodel.name) == gun_name && smodel.parent().map(|id| &self.model.submodels[id].name) == base_name;
+                if singlepart_valid {
+                    resolved = Some((smodel.id, smodel.id));
+                } else if multipart_valid {
+                    resolved = Some((smodel.parent().unwrap(), smodel.id));
+                }
+            }
+            let (base_model, gun_model) = match resolved {
+                Some(ids) => ids,
+                None => continue, // no base/gun here to sit on, so lose it
+            };
+            turret.base_model = base_model;
+            turret.gun_model = gun_model;
+            match self.import_window.import_type {
+                ImportType::Add => self.model.turrets.push(turret),
+                ImportType::MatchAndReplace => {
+                    if let Some(replaced_turret) = self.model.turrets.iter_mut().find(|replaced_turret| replaced_turret.base_model == base_model)
+                    {
+                        *replaced_turret = turret;
+                    } else {
+                        self.model.turrets.push(turret);
+                    }
+                }
+            }
+        }
+
+        // eye points: attach to the submodel with the same name, or to nothing if there is none
+        for mut point in imported_eyes {
+            let attached = point
+                .attached_submodel
+                .and_then(|id| import_submodel_names.get(id.0 as usize))
+                .and_then(|name| self.model.submodels.iter().find(|smodel| smodel.name == *name))
+                .map(|smodel| smodel.id);
+            point.attached_submodel = attached;
+            match self.import_window.import_type {
+                ImportType::Add => self.model.eye_points.push(point),
+                ImportType::MatchAndReplace => {
+                    // replace the existing eye on the same submodel - an unattached one (None)
+                    // matching another unattached one - else add it
+                    if let Some(replaced_point) = self.model.eye_points.iter_mut().find(|p| p.attached_submodel == attached) {
+                        *replaced_point = point;
+                    } else {
+                        self.model.eye_points.push(point);
+                    }
+                }
+            }
+        }
+
+        // glow banks: a bank always sits on a submodel, so a parent that resolves to no same-named
+        // submodel falls back to detail0 - or is dropped if there are no submodels at all here
+        for mut g_bank in imported_glows {
+            let parent = import_submodel_names
+                .get(g_bank.model_parent.0 as usize)
+                .and_then(|name| self.model.submodels.iter().find(|smodel| smodel.name == *name))
+                .map(|smodel| smodel.id);
+            if let Some(parent) = parent {
+                g_bank.model_parent = parent;
+            } else if self.model.submodels.is_empty() {
+                continue; // nothing to attach it to, so drop it
+            } else {
+                g_bank.model_parent = self.model.glow_bank_parent_fallback();
+            }
+            self.model.glow_banks.push(g_bank);
         }
 
         // now every selected path has landed, so each imported bay can follow the path it carried
