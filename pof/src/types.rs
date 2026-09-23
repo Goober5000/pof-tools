@@ -673,13 +673,13 @@ impl Path {
         }
     }
 
-    /// Adopts `new`'s parent and points, but keeps this path's name and per-point turret assignments.
-    pub fn take_geometry_from(&mut self, mut new: Path) {
-        for (old_point, new_point) in self.points.iter_mut().zip(&mut new.points) {
-            new_point.turrets = std::mem::take(&mut old_point.turrets);
+    /// Adopts `other`'s parent and points, but keeps this path's name and per-point turret assignments.
+    pub fn take_geometry_from(&mut self, mut other: Path) {
+        for (own_point, other_point) in self.points.iter_mut().zip(&mut other.points) {
+            other_point.turrets = std::mem::take(&mut own_point.turrets);
         }
-        self.parent = new.parent;
-        self.points = new.points;
+        self.parent = other.parent;
+        self.points = other.points;
     }
 
     /// Whether regenerating this path as `generated` would change nothing, so needn't cost an undo step.
