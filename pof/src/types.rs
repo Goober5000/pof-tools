@@ -2722,20 +2722,6 @@ impl Model {
         }
     }
 
-    /// The paths claimed by `targets` and nothing else, i.e. those they'd leave belonging to nothing.
-    /// Ask before removing anything, since it reads the claims from the model as it stands.
-    pub fn paths_claimed_only_by(&self, targets: &[PathTarget]) -> Vec<PathId> {
-        let targets: Vec<PathTarget> = targets.iter().map(|&target| self.canonical_path_target(target)).collect();
-        let index = self.path_name_index();
-        (0..self.paths.len())
-            .map(|idx| PathId(idx as u32))
-            .filter(|&id| {
-                let claimants = self.path_claimants(&index, id);
-                !claimants.is_empty() && claimants.iter().all(|claimant| targets.contains(claimant))
-            })
-            .collect()
-    }
-
     /// The path FSO would use for `target`: the first one it claims.
     pub fn first_path_for(&self, index: &PathNameIndex, target: PathTarget) -> Option<PathId> {
         let target = self.canonical_path_target(target);

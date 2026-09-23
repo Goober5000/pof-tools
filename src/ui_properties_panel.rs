@@ -1589,21 +1589,6 @@ impl PofToolsGui {
                                 let mut turrets = self.model.turrets.clone();
                                 let mut eye_points = self.model.eye_points.clone();
                                 let mut docking_bays = self.model.docking_bays.clone();
-                                let mut paths = self.model.paths.clone();
-
-                                // the docking bays parented to this submodel go with it
-                                let doomed_bays: Vec<usize> = (0..self.model.docking_bays.len())
-                                    .filter(|&bay| {
-                                        pof::properties_get_field(&self.model.docking_bays[bay].properties, "$parent_submodel")
-                                            == Some(self.model.submodels[deleted_id].name.as_str())
-                                    })
-                                    .collect();
-
-                                // and so do the paths only they claim - worked out before anything is pruned
-                                let doomed_targets: Vec<PathTarget> = std::iter::once(PathTarget::Submodel(deleted_id))
-                                    .chain(doomed_bays.iter().map(|&bay| PathTarget::DockingBay(bay)))
-                                    .collect();
-                                let doomed_paths = self.model.paths_claimed_only_by(&doomed_targets);
 
                                 self.model.header.num_submodels -= 1;
                                 let mut removed_detail = false;
@@ -1653,18 +1638,10 @@ impl PofToolsGui {
                                     }
                                 });
 
-                                let mut bay_idx = 0;
-                                self.model.pof_model.docking_bays.retain(|_| {
-                                    let doomed = doomed_bays.contains(&bay_idx);
-                                    bay_idx += 1;
-                                    !doomed
+                                self.model.pof_model.docking_bays.retain_mut(|bay| {
+                                    let str = pof::properties_get_field(&bay.properties, "$parent_submodel");
+                                    str.is_none() || str.unwrap() != self.model.pof_model.submodels[deleted_id].name
                                 });
-
-                                // highest first, so each fixup of the bays' links doesn't shift the removals still to come
-                                for &removed in doomed_paths.iter().rev() {
-                                    self.model.pof_model.paths.remove(removed.0 as usize);
-                                    self.model.pof_model.path_removal_fixup(removed);
-                                }
 
                                 let mut buffer_mesh = Some(self.model.buffer_meshes.remove(index));
                                 let mut matrix = Some(self.model.submodel_transform_matrix.remove(index));
@@ -1695,7 +1672,6 @@ impl PofToolsGui {
                                             swap(&mut model.glow_banks, &mut glow_banks);
                                             swap(&mut model.turrets, &mut turrets);
                                             swap(&mut model.eye_points, &mut eye_points);
-                                            swap(&mut model.paths, &mut paths);
                                             swap(&mut model.docking_bays, &mut docking_bays);
 
                                             undo = !undo;
