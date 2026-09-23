@@ -2327,13 +2327,12 @@ impl PofToolsGui {
 
                 ui.separator();
 
-                let smodel_target = selected_id.map(|id| self.model.canonical_path_target(PathTarget::Submodel(id)));
                 let disabled_text = if selected_id.is_some() {
-                    "Only named $special=subsystem submodels get paths in FSO"
+                    "Only named submodels which are $special=subsystem or a turret base get paths"
                 } else {
                     "Select a submodel first"
                 };
-                if path_gen_button(ui, undo_history, &mut self.model, smodel_target, disabled_text) {
+                if path_gen_button(ui, undo_history, &mut self.model, selected_id.map(PathTarget::Submodel), disabled_text) {
                     self.ui_state.properties_panel_dirty = true;
                 }
 
@@ -3371,7 +3370,8 @@ impl PofToolsGui {
                 } else {
                     "Select a turret first"
                 };
-                if path_gen_button(ui, undo_history, &mut self.model, turret_num.map(PathTarget::Turret), disabled_text) {
+                let base_target = turret_num.map(|turret| PathTarget::Submodel(self.model.turrets[turret].base_model));
+                if path_gen_button(ui, undo_history, &mut self.model, base_target, disabled_text) {
                     self.ui_state.properties_panel_dirty = true;
                 }
 

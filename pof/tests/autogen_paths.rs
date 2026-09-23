@@ -104,20 +104,29 @@ fn dock_paths_are_named_and_assigned() {
 }
 
 #[test]
-fn turret_beats_submodel_path() {
-    let model = turret_model();
+fn a_turret_base_path_comes_in_along_the_turret() {
+    let mut model = turret_model();
+    // facing up, so the turret's direction differs from the radial one a plain submodel gets
+    model.turrets[0].normal = NormalVec3::try_from(Vec3d::new(0.0, 1.0, 0.0)).unwrap();
     let (paths, _) = model.compute_auto_gen_paths();
-    assert_eq!(
-        parents(&paths),
-        vec!["turret01", "engine01"],
-        "turret path first, and no second, wrongly shaped path for its base submodel"
-    );
+    assert_eq!(parents(&paths), vec!["engine01", "turret01"], "one path for the base, in submodel order");
+
+    // turret01 sits at (10, 0, 0) with radius 5, so the first point is 1.2 * 150 out along the normal
+    assert_eq!(paths[1].points[0].position, Vec3d::new(10.0, 180.0, 0.0));
+}
+
+#[test]
+fn a_turret_base_gets_a_path_without_special_subsystem() {
+    let mut model = turret_model();
+    model.submodels[SubmodelId(3)].properties = String::new();
+    assert!(model.path_targets().contains(&PathTarget::Submodel(SubmodelId(3))));
+    assert_eq!(parents(&model.compute_auto_gen_paths().0), vec!["engine01", "turret01"]);
 }
 
 // ---------------------------------------------------------------- path targets
 
 #[test]
-fn path_targets_are_in_generation_order_and_skip_turret_bases() {
+fn path_targets_are_in_generation_order() {
     let mut model = turret_model();
     model.special_points.push(SpecialPoint {
         name: "$repair".into(),
@@ -131,20 +140,12 @@ fn path_targets_are_in_generation_order_and_skip_turret_bases() {
     assert_eq!(
         model.path_targets(),
         vec![
-            PathTarget::Turret(0),
-            PathTarget::Submodel(SubmodelId(1)), // engine01, but NOT turret01 (SubmodelId(3))
+            PathTarget::Submodel(SubmodelId(1)), // engine01
+            PathTarget::Submodel(SubmodelId(3)), // turret01, the turret base; not its barrel
             PathTarget::SpecialPoint(0),         // $repair, but not the non-subsystem $decor
             PathTarget::DockingBay(0),
         ]
     );
-}
-
-#[test]
-fn canonical_path_target_folds_a_turret_base_into_its_turret() {
-    let model = turret_model();
-    assert_eq!(model.canonical_path_target(PathTarget::Submodel(SubmodelId(3))), PathTarget::Turret(0));
-    assert_eq!(model.canonical_path_target(PathTarget::Submodel(SubmodelId(1))), PathTarget::Submodel(SubmodelId(1)));
-    assert_eq!(model.canonical_path_target(PathTarget::DockingBay(4)), PathTarget::DockingBay(4));
 }
 
 #[test]
@@ -172,7 +173,7 @@ fn path_target_finds_the_owning_object() {
     model.paths.push(Path { name: "$path02".into(), parent: "Engine01".into(), points: vec![] });
     model.paths.push(Path { name: "$path03".into(), parent: "nothing here".into(), points: vec![] });
 
-    assert_eq!(model.path_target(&model.path_name_index(), PathId(0)), Some(PathTarget::Turret(0)));
+    assert_eq!(model.path_target(&model.path_name_index(), PathId(0)), Some(PathTarget::Submodel(SubmodelId(3))));
     assert_eq!(model.path_target(&model.path_name_index(), PathId(1)), Some(PathTarget::Submodel(SubmodelId(1))));
     assert_eq!(model.path_target(&model.path_name_index(), PathId(2)), None, "an unmatched parent is legitimate, not an error");
     assert_eq!(model.path_target(&model.path_name_index(), PathId(99)), None, "a dangling id must not panic or claim a path");
@@ -214,9 +215,9 @@ fn an_ordinary_path_has_exactly_one_claimant() {
         model.docking_bays[bay].path = Some(path);
     }
 
-    // a turret path names the base submodel, but the turret and its base are one object
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(0)), vec![PathTarget::Turret(0)]);
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(1)), vec![PathTarget::Submodel(SubmodelId(1))]);
+    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(0)), vec![PathTarget::Submodel(SubmodelId(1))]);
+    // the turret's path belongs to its base submodel alone
+    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(1)), vec![PathTarget::Submodel(SubmodelId(3))]);
     assert_eq!(model.path_claimants(&model.path_name_index(), PathId(2)), vec![PathTarget::DockingBay(0)]);
     assert!((0..3).all(|idx| !model.path_is_contested(&model.path_name_index(), PathId(idx))));
 
@@ -299,12 +300,12 @@ fn bays_sharing_a_path_with_a_named_object_still_contest_it() {
     let mut model = turret_model();
     let (generated, _) = model.compute_auto_gen_paths();
     model.paths.extend(generated);
-    assert_eq!(model.paths[0].parent, "turret01");
+    assert_eq!(model.paths[1].parent, "turret01");
 
-    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
-    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
+    model.docking_bays.push(Dock { path: Some(PathId(1)), ..Default::default() });
+    model.docking_bays.push(Dock { path: Some(PathId(1)), ..Default::default() });
 
-    assert!(model.path_is_contested(&model.path_name_index(), PathId(0)));
+    assert!(model.path_is_contested(&model.path_name_index(), PathId(1)));
 }
 
 #[test]
@@ -335,19 +336,22 @@ fn a_bay_linked_to_another_objects_path_is_contested() {
     let mut model = turret_model();
     let (generated, _) = model.compute_auto_gen_paths();
     model.paths.extend(generated);
-    assert_eq!(model.paths[0].parent, "turret01");
+    assert_eq!(model.paths[1].parent, "turret01");
 
-    model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
+    model.docking_bays.push(Dock { path: Some(PathId(1)), ..Default::default() });
 
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(0)), vec![PathTarget::Turret(0), PathTarget::DockingBay(0)]);
-    assert!(model.path_is_contested(&model.path_name_index(), PathId(0)));
+    assert_eq!(
+        model.path_claimants(&model.path_name_index(), PathId(1)),
+        vec![PathTarget::Submodel(SubmodelId(3)), PathTarget::DockingBay(0)]
+    );
+    assert!(model.path_is_contested(&model.path_name_index(), PathId(1)));
 
     // a path of its own settles it, since a $dockNN-01 parent names no object
     model.paths.push(Path { name: "$path09".into(), parent: "$dock01-01".into(), points: vec![] });
     let own_path = PathId(model.paths.len() as u32 - 1);
     model.docking_bays[0].path = Some(own_path);
     assert_eq!(model.path_claimants(&model.path_name_index(), own_path), vec![PathTarget::DockingBay(0)]);
-    assert!(!model.path_is_contested(&model.path_name_index(), PathId(0)));
+    assert!(!model.path_is_contested(&model.path_name_index(), PathId(1)));
 }
 
 #[test]
@@ -653,7 +657,7 @@ fn nothing_unnamed_can_own_a_path() {
         radius: 2.0,
     });
 
-    assert!(!model.can_own_a_path(PathTarget::Turret(0)), "turret with an unnamed base");
+    assert!(!model.can_own_a_path(PathTarget::Submodel(SubmodelId(4))), "unnamed turret base");
     assert!(!model.can_own_a_path(PathTarget::Submodel(SubmodelId(3))), "unnamed subsystem submodel");
     assert!(!model.can_own_a_path(PathTarget::SpecialPoint(0)), "unnamed subsystem special point");
     assert!(model.can_own_a_path(PathTarget::Submodel(SubmodelId(1))), "engine01 still can");

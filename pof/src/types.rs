@@ -697,7 +697,6 @@ impl Path {
 /// A model object which can own a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PathTarget {
-    Turret(usize),
     Submodel(SubmodelId),
     SpecialPoint(usize),
     DockingBay(usize),
@@ -2526,51 +2525,32 @@ impl Model {
         numbers.max().unwrap_or(0) + 1
     }
 
-    /// Every object which can own a path, in generation order: turrets, subsystem submodels, subsystem
-    /// special points, then docking bays. A turret base submodel is represented by its turret.
+    /// Every object which can own a path, in generation order: submodels, special points, then docking bays.
     pub fn path_targets(&self) -> Vec<PathTarget> {
-        let turrets = (0..self.turrets.len()).map(PathTarget::Turret);
         let submodels = self.submodels.iter().map(|smodel| PathTarget::Submodel(smodel.id));
         let spcls = (0..self.special_points.len()).map(PathTarget::SpecialPoint);
         let bays = (0..self.docking_bays.len()).map(PathTarget::DockingBay);
 
-        turrets
-            .chain(submodels)
-            .chain(spcls)
-            .chain(bays)
-            // drops turret base submodels, which their turrets stand for
-            .filter(|&target| self.canonical_path_target(target) == target && self.can_own_a_path(target))
-            .collect()
+        submodels.chain(spcls).chain(bays).filter(|&target| self.can_own_a_path(target)).collect()
     }
 
-    /// Whether FSO would give this object a path: turrets and docking bays always, submodels and special
-    /// points only when `$special=subsystem`. False for an out of range index.
+    /// Whether this object gets a path: docking bays always, submodels which are turret bases or
+    /// `$special=subsystem`, and special points which are `$special=subsystem`. False for an out of range index.
     pub fn can_own_a_path(&self, target: PathTarget) -> bool {
         // a path finds its object by name, so an unnamed object can't own one. This also stops an empty
         // parent - which every pre-20.02 POF has - resolving to anything, as in FSO.
         let named = |name: &str| !normalized_path_name(name).is_empty();
 
         match target {
-            PathTarget::Turret(idx) => self
-                .turrets
-                .get(idx)
-                .and_then(|turret| self.submodels.get(turret.base_model.0 as usize))
-                .is_some_and(|base| named(&base.name)),
-            PathTarget::Submodel(id) => self.submodels.get(id.0 as usize).is_some_and(|s| s.is_subsystem() && named(&s.name)),
+            // a turret base gets one even without $special=subsystem, so it's ready when the flag is added
+            PathTarget::Submodel(id) => self
+                .submodels
+                .get(id.0 as usize)
+                .is_some_and(|s| named(&s.name) && (s.is_subsystem() || self.turrets.iter().any(|turret| turret.base_model == id))),
             PathTarget::SpecialPoint(idx) => self.special_points.get(idx).is_some_and(|s| s.is_subsystem() && named(&s.name)),
             // a bay claims its path by index link, not by name
             PathTarget::DockingBay(idx) => idx < self.docking_bays.len(),
         }
-    }
-
-    /// Turns a turret base submodel into its turret; any other target is returned as is.
-    pub fn canonical_path_target(&self, target: PathTarget) -> PathTarget {
-        if let PathTarget::Submodel(id) = target {
-            if let Some(idx) = self.turrets.iter().position(|turret| turret.base_model == id) {
-                return PathTarget::Turret(idx);
-            }
-        }
-        target
     }
 
     /// Indexes the objects which can own a path by the name they answer to.
@@ -2617,7 +2597,6 @@ impl Model {
     /// The name `target` answers to, which its generated path uses as parent. `None` for docking bays.
     pub fn target_parent_name(&self, target: PathTarget) -> Option<&str> {
         match target {
-            PathTarget::Turret(idx) => Some(&self.submodels[self.turrets[idx].base_model].name),
             PathTarget::Submodel(id) => Some(&self.submodels[id].name),
             PathTarget::SpecialPoint(idx) => Some(&self.special_points[idx].name),
             PathTarget::DockingBay(_) => None,
@@ -2627,38 +2606,16 @@ impl Model {
     /// Builds the PCS2-style path for `target`. Panics if its index is out of range.
     pub fn gen_path_for(&self, target: PathTarget, name: String) -> Path {
         match target {
-            PathTarget::Turret(idx) => {
-                let turret = &self.turrets[idx];
-                let base = &self.submodels[turret.base_model];
-                let offset = self.get_total_submodel_offset(turret.base_model);
-                let r = base.radius;
-                let r0 = (r * 30.0_f32).min(1000.0);
-                let r1 = (r * 2.0_f32).min(100.0);
-                let n = turret.normal.0;
-                Path {
-                    name,
-                    parent: base.name.clone(),
-                    points: vec![
-                        PathPoint {
-                            position: offset + n * (r0 * 1.2),
-                            radius: r0,
-                            turrets: vec![],
-                        },
-                        PathPoint {
-                            position: offset + n * (r * 4.0),
-                            radius: r1,
-                            turrets: vec![],
-                        },
-                    ],
-                }
-            }
             PathTarget::Submodel(id) => {
                 let smodel = &self.submodels[id];
                 let offset = self.get_total_submodel_offset(id);
                 let r = smodel.radius;
                 let r0 = (r * 30.0_f32).min(1000.0);
                 let r1 = (r * 2.0_f32).min(100.0);
-                let n = if offset.is_null() {
+                // a turret is approached along the way it faces, anything else from the model's centre outward
+                let n = if let Some(turret) = self.turrets.iter().find(|turret| turret.base_model == id) {
+                    turret.normal.0
+                } else if offset.is_null() {
                     Vec3d::new(0.0, 1.0, 0.0)
                 } else {
                     offset.normalize()
@@ -2724,7 +2681,6 @@ impl Model {
 
     /// The path FSO would use for `target`: the first one it claims.
     pub fn first_path_for(&self, index: &PathNameIndex, target: PathTarget) -> Option<PathId> {
-        let target = self.canonical_path_target(target);
         (0..self.paths.len())
             .map(|idx| PathId(idx as u32))
             .find(|&id| self.path_claimants(index, id).contains(&target))
