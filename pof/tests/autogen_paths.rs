@@ -173,10 +173,10 @@ fn path_target_finds_the_owning_object() {
     model.paths.push(Path { name: "$path02".into(), parent: "Engine01".into(), points: vec![] });
     model.paths.push(Path { name: "$path03".into(), parent: "nothing here".into(), points: vec![] });
 
-    assert_eq!(model.path_target(&model.path_name_index(), PathId(0)), Some(PathTarget::Submodel(SubmodelId(3))));
-    assert_eq!(model.path_target(&model.path_name_index(), PathId(1)), Some(PathTarget::Submodel(SubmodelId(1))));
-    assert_eq!(model.path_target(&model.path_name_index(), PathId(2)), None, "an unmatched parent is legitimate, not an error");
-    assert_eq!(model.path_target(&model.path_name_index(), PathId(99)), None, "a dangling id must not panic or claim a path");
+    assert_eq!(model.path_target(PathId(0)), Some(PathTarget::Submodel(SubmodelId(3))));
+    assert_eq!(model.path_target(PathId(1)), Some(PathTarget::Submodel(SubmodelId(1))));
+    assert_eq!(model.path_target(PathId(2)), None, "an unmatched parent is legitimate, not an error");
+    assert_eq!(model.path_target(PathId(99)), None, "a dangling id must not panic or claim a path");
 }
 
 #[test]
@@ -186,8 +186,8 @@ fn a_docks_index_link_wins_over_the_parent_name() {
     model.paths.push(Path { name: "$path01".into(), parent: "turret01".into(), points: vec![] });
     model.docking_bays.push(Dock { path: Some(PathId(0)), ..Default::default() });
 
-    assert_eq!(model.path_target(&model.path_name_index(), PathId(0)), Some(PathTarget::DockingBay(0)), "the index link is what FSO follows");
-    assert_eq!(model.first_path_for(&model.path_name_index(), PathTarget::DockingBay(0)), Some(PathId(0)));
+    assert_eq!(model.path_target(PathId(0)), Some(PathTarget::DockingBay(0)), "the index link is what FSO follows");
+    assert_eq!(model.first_path_for(PathTarget::DockingBay(0)), Some(PathId(0)));
 }
 
 #[test]
@@ -197,10 +197,10 @@ fn extra_paths_for_one_target_are_all_reported_but_only_the_first_is_live() {
     model.paths.push(Path { name: "$path02".into(), parent: "$ENGINE01".into(), points: vec![] });
 
     let target = PathTarget::Submodel(SubmodelId(1));
-    assert!(model.path_claimants(&model.path_name_index(), PathId(0)).contains(&target));
-    assert!(model.path_claimants(&model.path_name_index(), PathId(1)).contains(&target));
+    assert!(model.path_claimants(PathId(0)).contains(&target));
+    assert!(model.path_claimants(PathId(1)).contains(&target));
     // FSO's model_set_subsys_path_nums stops at the first match, so the second is dead weight
-    assert_eq!(model.first_path_for(&model.path_name_index(), target), Some(PathId(0)));
+    assert_eq!(model.first_path_for(target), Some(PathId(0)));
 }
 
 // ---------------------------------------------------------------- claimants
@@ -215,13 +215,13 @@ fn an_ordinary_path_has_exactly_one_claimant() {
         model.docking_bays[bay].path = Some(path);
     }
 
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(0)), vec![PathTarget::Submodel(SubmodelId(1))]);
+    assert_eq!(model.path_claimants(PathId(0)), vec![PathTarget::Submodel(SubmodelId(1))]);
     // the turret's path belongs to its base submodel alone
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(1)), vec![PathTarget::Submodel(SubmodelId(3))]);
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(2)), vec![PathTarget::DockingBay(0)]);
-    assert!((0..3).all(|idx| !model.path_is_contested(&model.path_name_index(), PathId(idx))));
+    assert_eq!(model.path_claimants(PathId(1)), vec![PathTarget::Submodel(SubmodelId(3))]);
+    assert_eq!(model.path_claimants(PathId(2)), vec![PathTarget::DockingBay(0)]);
+    assert!((0..3).all(|idx| !model.path_is_contested(PathId(idx))));
 
-    assert!(model.path_claimants(&model.path_name_index(), PathId(99)).is_empty(), "a dangling id claims nothing");
+    assert!(model.path_claimants(PathId(99)).is_empty(), "a dangling id claims nothing");
 }
 
 #[test]
@@ -244,13 +244,13 @@ fn a_name_shared_by_two_objects_is_contested() {
     // both objects find it, so neither panel offers to append another
     let smodel_target = PathTarget::Submodel(SubmodelId(3));
     let spcl_target = PathTarget::SpecialPoint(0);
-    assert_eq!(model.first_path_for(&model.path_name_index(), smodel_target), Some(PathId(1)));
-    assert_eq!(model.first_path_for(&model.path_name_index(), spcl_target), Some(PathId(1)));
+    assert_eq!(model.first_path_for(smodel_target), Some(PathId(1)));
+    assert_eq!(model.first_path_for(spcl_target), Some(PathId(1)));
 
     // ...and they're both claiming it, so neither may regenerate it. The name collision is a real
     // problem with the model, and the user resolves it by renaming one of the two.
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(1)), vec![smodel_target, spcl_target]);
-    assert!(model.path_is_contested(&model.path_name_index(), PathId(1)));
+    assert_eq!(model.path_claimants(PathId(1)), vec![smodel_target, spcl_target]);
+    assert!(model.path_is_contested(PathId(1)));
 }
 
 #[test]
@@ -268,9 +268,9 @@ fn a_decorative_object_lays_no_claim_to_a_subsystems_path() {
     model.paths.extend(generated);
 
     let sensors = PathId(1);
-    assert_eq!(model.path_claimants(&model.path_name_index(), sensors), vec![PathTarget::Submodel(SubmodelId(3))]);
-    assert!(!model.path_is_contested(&model.path_name_index(), sensors), "a decorative namesake must not deadlock the subsystem");
-    assert_eq!(model.path_target(&model.path_name_index(), sensors), Some(PathTarget::Submodel(SubmodelId(3))), "and it keeps submodel geometry");
+    assert_eq!(model.path_claimants(sensors), vec![PathTarget::Submodel(SubmodelId(3))]);
+    assert!(!model.path_is_contested(sensors), "a decorative namesake must not deadlock the subsystem");
+    assert_eq!(model.path_target(sensors), Some(PathTarget::Submodel(SubmodelId(3))), "and it keeps submodel geometry");
 }
 
 #[test]
@@ -286,11 +286,11 @@ fn docking_bays_sharing_a_path_dont_contest_it() {
     model.docking_bays[0].path = Some(PathId(1));
     model.docking_bays[1].path = Some(PathId(1));
 
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(1)), vec![PathTarget::DockingBay(0), PathTarget::DockingBay(1)]);
-    assert!(!model.path_is_contested(&model.path_name_index(), PathId(1)));
+    assert_eq!(model.path_claimants(PathId(1)), vec![PathTarget::DockingBay(0), PathTarget::DockingBay(1)]);
+    assert!(!model.path_is_contested(PathId(1)));
     // each bay has its path, so neither is offered another, and auto-gen leaves them be
-    assert_eq!(model.first_path_for(&model.path_name_index(), PathTarget::DockingBay(0)), Some(PathId(1)));
-    assert_eq!(model.first_path_for(&model.path_name_index(), PathTarget::DockingBay(1)), Some(PathId(1)));
+    assert_eq!(model.first_path_for(PathTarget::DockingBay(0)), Some(PathId(1)));
+    assert_eq!(model.first_path_for(PathTarget::DockingBay(1)), Some(PathId(1)));
     assert!(model.compute_auto_gen_paths().0.is_empty());
 }
 
@@ -305,7 +305,7 @@ fn bays_sharing_a_path_with_a_named_object_still_contest_it() {
     model.docking_bays.push(Dock { path: Some(PathId(1)), ..Default::default() });
     model.docking_bays.push(Dock { path: Some(PathId(1)), ..Default::default() });
 
-    assert!(model.path_is_contested(&model.path_name_index(), PathId(1)));
+    assert!(model.path_is_contested(PathId(1)));
 }
 
 #[test]
@@ -327,8 +327,7 @@ fn a_path_docking_bays_share_is_rebuilt_once_for_the_first_of_them() {
     let bay0 = model.gen_path_for(PathTarget::DockingBay(0), String::new());
     let positions = |path: &Path| path.points.iter().map(|point| point.position).collect::<Vec<_>>();
     assert_eq!(positions(&model.paths[1]), positions(&bay0));
-    let index = model.path_name_index();
-    assert_eq!(model.path_target(&index, PathId(1)), Some(PathTarget::DockingBay(0)), "the same bay the per-path button rebuilds from");
+    assert_eq!(model.path_target(PathId(1)), Some(PathTarget::DockingBay(0)), "the same bay the per-path button rebuilds from");
 }
 
 #[test]
@@ -341,17 +340,17 @@ fn a_bay_linked_to_another_objects_path_is_contested() {
     model.docking_bays.push(Dock { path: Some(PathId(1)), ..Default::default() });
 
     assert_eq!(
-        model.path_claimants(&model.path_name_index(), PathId(1)),
+        model.path_claimants(PathId(1)),
         vec![PathTarget::Submodel(SubmodelId(3)), PathTarget::DockingBay(0)]
     );
-    assert!(model.path_is_contested(&model.path_name_index(), PathId(1)));
+    assert!(model.path_is_contested(PathId(1)));
 
     // a path of its own settles it, since a $dockNN-01 parent names no object
     model.paths.push(Path { name: "$path09".into(), parent: "$dock01-01".into(), points: vec![] });
     let own_path = PathId(model.paths.len() as u32 - 1);
     model.docking_bays[0].path = Some(own_path);
-    assert_eq!(model.path_claimants(&model.path_name_index(), own_path), vec![PathTarget::DockingBay(0)]);
-    assert!(!model.path_is_contested(&model.path_name_index(), PathId(1)));
+    assert_eq!(model.path_claimants(own_path), vec![PathTarget::DockingBay(0)]);
+    assert!(!model.path_is_contested(PathId(1)));
 }
 
 #[test]
@@ -369,11 +368,11 @@ fn two_objects_of_the_same_kind_sharing_a_name_are_contested() {
     assert!(model.compute_auto_gen_paths().0.is_empty(), "and generating again adds nothing");
 
     let (first, second) = (PathTarget::Submodel(SubmodelId(1)), PathTarget::Submodel(SubmodelId(3)));
-    assert_eq!(model.path_claimants(&model.path_name_index(), PathId(0)), vec![first, second]);
-    assert!(model.path_is_contested(&model.path_name_index(), PathId(0)));
+    assert_eq!(model.path_claimants(PathId(0)), vec![first, second]);
+    assert!(model.path_is_contested(PathId(0)));
     // neither is left looking pathless, which would have the panel offer to append another
-    assert_eq!(model.first_path_for(&model.path_name_index(), first), Some(PathId(0)));
-    assert_eq!(model.first_path_for(&model.path_name_index(), second), Some(PathId(0)));
+    assert_eq!(model.first_path_for(first), Some(PathId(0)));
+    assert_eq!(model.first_path_for(second), Some(PathId(0)));
 }
 
 #[test]
@@ -446,15 +445,15 @@ fn everything_which_claims_a_path_is_something_which_could_own_one() {
 
     let targets = model.path_targets();
     for idx in 0..model.paths.len() {
-        for claimant in model.path_claimants(&model.path_name_index(), PathId(idx as u32)) {
+        for claimant in model.path_claimants(PathId(idx as u32)) {
             assert!(model.can_own_a_path(claimant), "path {} claimed by {:?} which cannot own one", idx, claimant);
             assert!(targets.contains(&claimant), "path {} claimed by {:?} which path_targets does not yield", idx, claimant);
         }
     }
 
     // the decorative namesakes leave the real subsystems alone
-    assert!(!model.path_is_contested(&model.path_name_index(), PathId(0)), "turret01");
-    assert!(!model.path_is_contested(&model.path_name_index(), PathId(1)), "engine01");
+    assert!(!model.path_is_contested(PathId(0)), "turret01");
+    assert!(!model.path_is_contested(PathId(1)), "engine01");
 }
 
 // ---------------------------------------------------------------- name allocation
@@ -619,9 +618,9 @@ fn an_empty_parent_names_nothing() {
     model.paths.push(Path { name: "$path02".into(), parent: "$".into(), points: vec![] });
 
     for idx in 0..2 {
-        assert!(model.path_claimants(&model.path_name_index(), PathId(idx)).is_empty(), "path {} claims nothing", idx);
-        assert!(!model.path_is_contested(&model.path_name_index(), PathId(idx)));
-        assert_eq!(model.path_target(&model.path_name_index(), PathId(idx)), None);
+        assert!(model.path_claimants(PathId(idx)).is_empty(), "path {} claims nothing", idx);
+        assert!(!model.path_is_contested(PathId(idx)));
+        assert_eq!(model.path_target(PathId(idx)), None);
     }
 
     // an object with no name can't be pointed at by a parent, so it isn't a target at all - offering

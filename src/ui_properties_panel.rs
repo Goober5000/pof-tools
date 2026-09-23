@@ -105,9 +105,8 @@ fn path_gen_button(
 ) -> bool {
     let target = target.filter(|&target| model.can_own_a_path(target));
 
-    let index = model.path_name_index();
-    let existing = target.and_then(|target| model.first_path_for(&index, target));
-    let contested = existing.is_some_and(|path| model.path_is_contested(&index, path));
+    let existing = target.and_then(|target| model.first_path_for(target));
+    let contested = existing.is_some_and(|path| model.path_is_contested(path));
     let label = if existing.is_some() { "Regenerate Path" } else { "Generate Path" };
 
     let response = ui
@@ -3546,9 +3545,8 @@ impl PofToolsGui {
                 ui.separator();
 
                 // Rebuild just this path, from whichever object claims it
-                let index = self.model.path_name_index();
-                let regen_target = path_num.and_then(|num| self.model.path_target(&index, PathId(num as u32)));
-                let contested = path_num.is_some_and(|num| self.model.path_is_contested(&index, PathId(num as u32)));
+                let regen_target = path_num.and_then(|num| self.model.path_target(PathId(num as u32)));
+                let contested = path_num.is_some_and(|num| self.model.path_is_contested(PathId(num as u32)));
                 let response = ui
                     .add_enabled(regen_target.is_some() && !contested, egui::Button::new("Regenerate This Path"))
                     .on_hover_text("Rebuilds this path's points from the object which claims it, keeping its name")

@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt::{Debug, Display};
 use std::io::{self, Write};
@@ -705,18 +705,6 @@ pub enum PathTarget {
 /// A name as FSO compares a path parent with it: case-insensitive, ignoring a leading '$'.
 pub fn normalized_path_name(name: &str) -> String {
     name.strip_prefix('$').unwrap_or(name).to_ascii_lowercase()
-}
-
-/// The objects which can own a path, by normalized name. Docking bays aren't in it: they claim by index link.
-pub struct PathNameIndex {
-    by_name: HashMap<String, Vec<PathTarget>>,
-}
-
-impl PathNameIndex {
-    /// The targets a path `parent` string names, in `path_targets` order.
-    fn matches(&self, parent: &str) -> &[PathTarget] {
-        self.by_name.get(&normalized_path_name(parent)).map_or(&[], Vec::as_slice)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -2553,42 +2541,30 @@ impl Model {
         }
     }
 
-    /// Indexes the objects which can own a path by the name they answer to.
-    pub fn path_name_index(&self) -> PathNameIndex {
-        let mut by_name: HashMap<String, Vec<PathTarget>> = HashMap::new();
-        for target in self.path_targets() {
-            // docking bays have no name
-            let Some(name) = self.target_parent_name(target).map(normalized_path_name) else {
-                continue;
-            };
-            by_name.entry(name).or_default().push(target);
-        }
-        PathNameIndex { by_name }
-    }
-
-    /// Every object claiming this path: docking bays linked to it, plus whatever its parent name resolves to.
-    pub fn path_claimants(&self, index: &PathNameIndex, path: PathId) -> Vec<PathTarget> {
-        let Some(parent) = self.paths.get(path.0 as usize).map(|path| &path.parent) else {
+    /// Every object claiming this path: whatever its parent name resolves to, then the docking bays linked to it.
+    pub fn path_claimants(&self, path: PathId) -> Vec<PathTarget> {
+        // a stale id, from a path deleted this frame, claims nothing
+        let Some(entry) = self.paths.get(path.0 as usize) else {
             return vec![];
         };
+        let parent = normalized_path_name(&entry.parent);
 
+        let named = self
+            .path_targets()
+            .into_iter()
+            .filter(|&target| self.target_parent_name(target).is_some_and(|name| normalized_path_name(name) == parent));
         let bays = self
             .docking_bays
             .iter()
             .positions(|dock| dock.path == Some(path))
             .map(PathTarget::DockingBay);
-
-        // sorted, for a stable order to show the user
-        bays.chain(index.matches(parent).iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+        named.chain(bays).collect()
     }
 
     /// Whether this path is shared by objects which should have different paths, so regenerating it for
     /// one would reshape it for the others. Docking bays sharing a path are ordinary, and count as one claim.
-    pub fn path_is_contested(&self, index: &PathNameIndex, path: PathId) -> bool {
-        let claimants = self.path_claimants(index, path);
+    pub fn path_is_contested(&self, path: PathId) -> bool {
+        let claimants = self.path_claimants(path);
         let bays = claimants.iter().any(|claimant| matches!(claimant, PathTarget::DockingBay(_)));
         let others = claimants.iter().filter(|claimant| !matches!(claimant, PathTarget::DockingBay(_))).count();
         others + usize::from(bays) > 1
@@ -2680,21 +2656,25 @@ impl Model {
     }
 
     /// The path FSO would use for `target`: the first one it claims.
-    pub fn first_path_for(&self, index: &PathNameIndex, target: PathTarget) -> Option<PathId> {
-        (0..self.paths.len())
+    pub fn first_path_for(&self, target: PathTarget) -> Option<PathId> {
+        if !self.can_own_a_path(target) {
+            return None;
+        }
+        if let PathTarget::DockingBay(bay) = target {
+            return self.docking_bays[bay].path;
+        }
+        let name = normalized_path_name(self.target_parent_name(target)?);
+        self.paths
+            .iter()
+            .position(|path| normalized_path_name(&path.parent) == name)
             .map(|idx| PathId(idx as u32))
-            .find(|&id| self.path_claimants(index, id).contains(&target))
     }
 
     /// The object a path belongs to, if any. A docking bay's link wins over a name match, as in FSO.
-    pub fn path_target(&self, index: &PathNameIndex, path: PathId) -> Option<PathTarget> {
-        let parent = &self.paths.get(path.0 as usize)?.parent;
-
-        if let Some(bay_idx) = self.docking_bays.iter().position(|dock| dock.path == Some(path)) {
-            return Some(PathTarget::DockingBay(bay_idx));
-        }
-
-        index.matches(parent).first().copied()
+    pub fn path_target(&self, path: PathId) -> Option<PathTarget> {
+        let claimants = self.path_claimants(path);
+        let bay = claimants.iter().find(|claimant| matches!(claimant, PathTarget::DockingBay(_)));
+        bay.or(claimants.first()).copied()
     }
 
     /// Computes paths to auto-generate for all turrets, `$special=subsystem` submodels,
@@ -2706,13 +2686,17 @@ impl Model {
         let mut new_paths: Vec<Path> = Vec::new();
         let mut dock_assignments: Vec<(usize, PathId)> = Vec::new();
         let mut number = self.next_path_number();
-        let index = self.path_name_index();
-        let mut covered: BTreeSet<PathTarget> = (0..self.paths.len())
-            .flat_map(|idx| self.path_claimants(&index, PathId(idx as u32)))
-            .collect();
+        // the names existing paths point at; an object answering to one already has its path
+        let mut claimed_names: HashSet<String> = self.paths.iter().map(|path| normalized_path_name(&path.parent)).collect();
 
         for target in self.path_targets() {
-            if covered.contains(&target) {
+            let covered = match target {
+                PathTarget::DockingBay(bay_idx) => self.docking_bays[bay_idx].path.is_some(),
+                _ => self
+                    .target_parent_name(target)
+                    .is_some_and(|name| claimed_names.contains(&normalized_path_name(name))),
+            };
+            if covered {
                 continue;
             }
             if let PathTarget::DockingBay(bay_idx) = target {
@@ -2722,8 +2706,7 @@ impl Model {
             number += 1;
 
             // everything its parent names now has a path, so two subsystems sharing a name get one between them
-            covered.extend(index.matches(&path.parent).iter().copied());
-            covered.insert(target);
+            claimed_names.insert(normalized_path_name(&path.parent));
 
             new_paths.push(path);
         }
@@ -2734,15 +2717,14 @@ impl Model {
     /// The existing paths which regenerating would change, already rebuilt: the one FSO uses for each
     /// target, leaving contested paths alone.
     pub fn compute_regenerated_paths(&self) -> Vec<(PathId, Path)> {
-        let index = self.path_name_index();
         let mut rebuilt = BTreeSet::new();
         let mut out = vec![];
         for target in self.path_targets() {
-            let Some(path_id) = self.first_path_for(&index, target) else {
+            let Some(path_id) = self.first_path_for(target) else {
                 continue;
             };
             // a path docking bays share is rebuilt once, for the first of them
-            if self.path_is_contested(&index, path_id) || !rebuilt.insert(path_id) {
+            if self.path_is_contested(path_id) || !rebuilt.insert(path_id) {
                 continue;
             }
             let existing = &self.paths[path_id.0 as usize];
