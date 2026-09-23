@@ -702,6 +702,16 @@ pub enum PathTarget {
     DockingBay(usize),
 }
 
+impl Display for PathTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            PathTarget::Submodel(id) => write!(f, "Submodel {}", id.0),
+            PathTarget::SpecialPoint(idx) => write!(f, "Special Point {}", idx + 1),
+            PathTarget::DockingBay(idx) => write!(f, "Bay {}", idx + 1),
+        }
+    }
+}
+
 /// A name as FSO compares a path parent with it: case-insensitive, ignoring a leading '$'.
 pub fn normalized_path_name(name: &str) -> String {
     name.strip_prefix('$').unwrap_or(name).to_ascii_lowercase()
@@ -2579,6 +2589,14 @@ impl Model {
         }
     }
 
+    /// How to name `target` to the user: its name and kind, or just the kind for a docking bay.
+    pub fn path_target_label(&self, target: PathTarget) -> String {
+        match self.target_parent_name(target) {
+            Some(name) => format!("{} ({})", name, target),
+            None => target.to_string(),
+        }
+    }
+
     /// Builds the PCS2-style path for `target`. Panics if its index is out of range.
     pub fn gen_path_for(&self, target: PathTarget, name: String) -> Path {
         match target {
@@ -2715,7 +2733,7 @@ impl Model {
     }
 
     /// The existing paths which regenerating would change, already rebuilt: the one FSO uses for each
-    /// target, leaving contested paths alone.
+    /// target. A path several objects claim is rebuilt once, for the one `path_target` picks.
     pub fn compute_regenerated_paths(&self) -> Vec<(PathId, Path)> {
         let mut rebuilt = BTreeSet::new();
         let mut out = vec![];
@@ -2723,12 +2741,14 @@ impl Model {
             let Some(path_id) = self.first_path_for(target) else {
                 continue;
             };
-            // a path docking bays share is rebuilt once, for the first of them
-            if self.path_is_contested(path_id) || !rebuilt.insert(path_id) {
+            if !rebuilt.insert(path_id) {
                 continue;
             }
+            let Some(winner) = self.path_target(path_id) else {
+                continue;
+            };
             let existing = &self.paths[path_id.0 as usize];
-            let generated = self.gen_path_for(target, String::new());
+            let generated = self.gen_path_for(winner, String::new());
             if !existing.geometry_matches(&generated) {
                 let mut path = existing.clone();
                 path.take_geometry_from(generated);

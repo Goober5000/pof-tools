@@ -97,8 +97,6 @@ fn generate_path_for(undo_history: &mut undo::History<UndoAction>, model: &mut M
     apply_path_changes(undo_history, model, new_paths, new_dock_refs);
 }
 
-const CONTESTED_TEXT: &str = "This path is shared by objects which should have different paths. Give one of them its own path first.";
-
 /// Generates `target`'s path, or regenerates the one FSO uses if it has one.
 fn path_gen_button(
     ui: &mut Ui, undo_history: &mut undo::History<UndoAction>, model: &mut Model, target: Option<PathTarget>, disabled_text: &str,
@@ -106,13 +104,26 @@ fn path_gen_button(
     let target = target.filter(|&target| model.can_own_a_path(target));
 
     let existing = target.and_then(|target| model.first_path_for(target));
-    let contested = existing.is_some_and(|path| model.path_is_contested(path));
     let label = if existing.is_some() { "Regenerate Path" } else { "Generate Path" };
 
     let response = ui
-        .add_enabled(target.is_some() && !contested, egui::Button::new(label))
-        .on_hover_text("Generated paths are generic approximations, and should be reviewed afterwards")
-        .on_disabled_hover_text(if contested { CONTESTED_TEXT } else { disabled_text });
+        .add_enabled(target.is_some(), egui::Button::new(label))
+        // naming the other claimants checks every object, so it's only worked out while the text shows
+        .on_hover_ui(|ui| {
+            ui.label("Generated paths are generic approximations, and should be reviewed afterwards");
+            if let (Some(target), Some(path)) = (target, existing) {
+                if model.path_is_contested(path) {
+                    let others: Vec<String> = model
+                        .path_claimants(path)
+                        .into_iter()
+                        .filter(|&claimant| claimant != target)
+                        .map(|claimant| model.path_target_label(claimant))
+                        .collect();
+                    ui.label(format!("Also used by {}. Regenerating reshapes it for {}.", others.join(" and "), model.path_target_label(target)));
+                }
+            }
+        })
+        .on_disabled_hover_text(disabled_text);
 
     if response.clicked() {
         let target = target.unwrap();
@@ -3545,14 +3556,29 @@ impl PofToolsGui {
                 ui.separator();
 
                 // Rebuild just this path, from whichever object claims it
-                let regen_target = path_num.and_then(|num| self.model.path_target(PathId(num as u32)));
-                let contested = path_num.is_some_and(|num| self.model.path_is_contested(PathId(num as u32)));
+                let path_id = path_num.map(|num| PathId(num as u32));
+                let regen_target = path_id.and_then(|path| self.model.path_target(path));
                 let response = ui
-                    .add_enabled(regen_target.is_some() && !contested, egui::Button::new("Regenerate This Path"))
-                    .on_hover_text("Rebuilds this path's points from the object which claims it, keeping its name")
-                    .on_disabled_hover_text(if contested {
-                        CONTESTED_TEXT
-                    } else if path_num.is_some() {
+                    .add_enabled(regen_target.is_some(), egui::Button::new("Regenerate This Path"))
+                    .on_hover_ui(|ui| {
+                        ui.label("Rebuilds this path's points from the object which claims it, keeping its name");
+                        if let (Some(path), Some(winner)) = (path_id, regen_target) {
+                            if self.model.path_is_contested(path) {
+                                let claimants: Vec<String> = self
+                                    .model
+                                    .path_claimants(path)
+                                    .into_iter()
+                                    .map(|claimant| self.model.path_target_label(claimant))
+                                    .collect();
+                                ui.label(format!(
+                                    "Claimed by {}. Regenerating reshapes it for {}.",
+                                    claimants.join(" and "),
+                                    self.model.path_target_label(winner)
+                                ));
+                            }
+                        }
+                    })
+                    .on_disabled_hover_text(if path_num.is_some() {
                         "This path's parent doesn't name any turret, subsystem or docking bay"
                     } else {
                         "Select a path first"

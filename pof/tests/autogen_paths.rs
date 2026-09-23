@@ -609,6 +609,24 @@ fn regenerating_freshly_generated_paths_changes_nothing() {
 }
 
 #[test]
+fn a_contested_path_is_regenerated_for_its_winner() {
+    let mut model = turret_model();
+    let (generated, _) = model.compute_auto_gen_paths();
+    model.paths.extend(generated);
+    // a bay pointed at turret01's path, whose shape it now doesn't match
+    model.docking_bays.push(Dock { path: Some(PathId(1)), ..Default::default() });
+    assert!(model.path_is_contested(PathId(1)));
+
+    // the bay's link wins, as for "Regenerate This Path"
+    let rebuilt = model.compute_regenerated_paths();
+    let bay = model.gen_path_for(PathTarget::DockingBay(0), String::new());
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].0, PathId(1));
+    assert_eq!(rebuilt[0].1.points.len(), bay.points.len());
+    assert_eq!(rebuilt[0].1.points[0].position, bay.points[0].position);
+}
+
+#[test]
 fn an_empty_parent_names_nothing() {
     // every path in a POF older than version 20.02 has an empty parent, since the field isn't
     // written before then, and FSO doesn't resolve those either
