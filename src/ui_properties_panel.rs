@@ -112,13 +112,13 @@ fn path_gen_button(
         .on_hover_ui(|ui| {
             ui.label("Generated paths are generic approximations, and should be reviewed afterwards");
             if let (Some(target), Some(path)) = (target, existing) {
-                if model.path_is_contested(path) {
-                    let others: Vec<String> = model
-                        .path_claimants(path)
-                        .into_iter()
-                        .filter(|&claimant| claimant != target)
-                        .map(|claimant| model.path_target_label(claimant))
-                        .collect();
+                let others: Vec<String> = model
+                    .path_claimants(path)
+                    .into_iter()
+                    .filter(|&claimant| claimant != target)
+                    .map(|claimant| model.path_target_label(claimant))
+                    .collect();
+                if !others.is_empty() {
                     ui.label(format!("Also used by {}. Regenerating reshapes it for {}.", others.join(" and "), model.path_target_label(target)));
                 }
             }
@@ -3563,13 +3563,13 @@ impl PofToolsGui {
                     .on_hover_ui(|ui| {
                         ui.label("Rebuilds this path's points from the object which claims it, keeping its name");
                         if let (Some(path), Some(winner)) = (path_id, regen_target) {
-                            if self.model.path_is_contested(path) {
-                                let claimants: Vec<String> = self
-                                    .model
-                                    .path_claimants(path)
-                                    .into_iter()
-                                    .map(|claimant| self.model.path_target_label(claimant))
-                                    .collect();
+                            let claimants: Vec<String> = self
+                                .model
+                                .path_claimants(path)
+                                .into_iter()
+                                .map(|claimant| self.model.path_target_label(claimant))
+                                .collect();
+                            if claimants.len() > 1 {
                                 ui.label(format!(
                                     "Claimed by {}. Regenerating reshapes it for {}.",
                                     claimants.join(" and "),

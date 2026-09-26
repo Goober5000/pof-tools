@@ -2571,15 +2571,6 @@ impl Model {
         named.chain(bays).collect()
     }
 
-    /// Whether this path is shared by objects which should have different paths, so regenerating it for
-    /// one would reshape it for the others. Docking bays sharing a path are ordinary, and count as one claim.
-    pub fn path_is_contested(&self, path: PathId) -> bool {
-        let claimants = self.path_claimants(path);
-        let bays = claimants.iter().any(|claimant| matches!(claimant, PathTarget::DockingBay(_)));
-        let others = claimants.iter().filter(|claimant| !matches!(claimant, PathTarget::DockingBay(_))).count();
-        others + usize::from(bays) > 1
-    }
-
     /// The name `target` answers to, which its generated path uses as parent. `None` for docking bays.
     pub fn target_parent_name(&self, target: PathTarget) -> Option<&str> {
         match target {
